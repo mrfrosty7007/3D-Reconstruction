@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Build
+build/
+dist/
+
+# Reconstruction outputs
+outputs/
+data/*/frames/
+data/*/sparse/
+data/*/dense/
+*.db
+
+# Temporary
+*.log
+*.tmp
