@@ -15,3 +15,8 @@ data/*/dense/
 *.db
 *.log
 *.tmp
+
+# Generated reconstruction data
+data/trial*
+data/prod*
+outputs/

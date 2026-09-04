@@ -10,23 +10,32 @@ from typing import Any, Dict, Optional
 
 
 class StageType(Enum):
-    """The 6 sequential reconstruction pipeline stages."""
+    """The 9 sequential reconstruction pipeline stages."""
     FRAME_EXTRACTION = "frames"
+    FILTER_FRAMES = "filter_frames"
     COLMAP_FEATURES = "colmap_features"
     COLMAP_MATCHING = "colmap_matching"
     COLMAP_MAPPER = "colmap_mapper"
-    GAUSSIAN_SPLATTING = "gsplat"
+    DENSE_STEREO = "dense_stereo"
+    STEREO_FUSION = "stereo_fusion"
+    POISSON_MESHING = "poisson_meshing"
     EXPORT = "export"
+
+    # Deprecated backwards-compatibility alias
+    GAUSSIAN_SPLATTING = "dense_stereo"
 
     @property
     def display_name(self) -> str:
         names = {
             StageType.FRAME_EXTRACTION: "1. Extract Frames",
-            StageType.COLMAP_FEATURES: "2. COLMAP Features",
-            StageType.COLMAP_MATCHING: "3. Feature Matching",
-            StageType.COLMAP_MAPPER: "4. Sparse Reconstruction",
-            StageType.GAUSSIAN_SPLATTING: "5. Training Gaussian Splatting",
-            StageType.EXPORT: "6. Exporting Model",
+            StageType.FILTER_FRAMES: "2. Filter Frames",
+            StageType.COLMAP_FEATURES: "3. COLMAP Features",
+            StageType.COLMAP_MATCHING: "4. Feature Matching",
+            StageType.COLMAP_MAPPER: "5. Sparse Reconstruction",
+            StageType.DENSE_STEREO: "6. Dense Stereo",
+            StageType.STEREO_FUSION: "7. Stereo Fusion",
+            StageType.POISSON_MESHING: "8. Poisson Meshing",
+            StageType.EXPORT: "9. Export Assets",
         }
         return names.get(self, self.value)
 
@@ -34,11 +43,14 @@ class StageType(Enum):
     def stage_number(self) -> int:
         numbers = {
             StageType.FRAME_EXTRACTION: 1,
-            StageType.COLMAP_FEATURES: 2,
-            StageType.COLMAP_MATCHING: 3,
-            StageType.COLMAP_MAPPER: 4,
-            StageType.GAUSSIAN_SPLATTING: 5,
-            StageType.EXPORT: 6,
+            StageType.FILTER_FRAMES: 2,
+            StageType.COLMAP_FEATURES: 3,
+            StageType.COLMAP_MATCHING: 4,
+            StageType.COLMAP_MAPPER: 5,
+            StageType.DENSE_STEREO: 6,
+            StageType.STEREO_FUSION: 7,
+            StageType.POISSON_MESHING: 8,
+            StageType.EXPORT: 9,
         }
         return numbers.get(self, 1)
 

@@ -262,34 +262,49 @@ class ModelExporter:
         session_dir: Path,
         session_frames_dir: Path,
         colmap_sparse_dir: Path,
-        ply_file: Path,
+        ply_file: Optional[Path] = None,
     ) -> Dict[str, str]:
-        """Packages all real 3D formats (PLY, OBJ, GLB, Trajectory, Thumbnail) into the session folder."""
+        """Packages all 3D mesh formats (OBJ, GLB, PLY, Trajectory, Thumbnail) into the session folder."""
         artifacts = {}
 
-        # 1. OBJ Export
+        # 1. OBJ Mesh Asset
         obj_file = session_dir / "model.obj"
-        if self.export_obj_mesh(ply_file, obj_file):
+        if obj_file.exists() and obj_file.stat().st_size > 0:
             artifacts["model_obj"] = "model.obj"
+        elif ply_file and ply_file.exists():
+            if self.export_obj_mesh(ply_file, obj_file):
+                artifacts["model_obj"] = "model.obj"
 
-        # 2. GLB Export
+        # 2. GLB Mesh Asset
         glb_file = session_dir / "model.glb"
-        if self.export_glb_asset(ply_file, glb_file):
+        if glb_file.exists() and glb_file.stat().st_size > 0:
             artifacts["model_glb"] = "model.glb"
+        elif ply_file and ply_file.exists():
+            if self.export_glb_asset(ply_file, glb_file):
+                artifacts["model_glb"] = "model.glb"
 
-        # 3. Trajectory Export
+        # 3. PLY Mesh Asset
+        model_ply_file = session_dir / "model.ply"
+        if model_ply_file.exists() and model_ply_file.stat().st_size > 0:
+            artifacts["model_ply"] = "model.ply"
+        elif ply_file and ply_file.exists():
+            artifacts["point_cloud_ply"] = ply_file.name
+
+        # 4. Dense Fused PLY (if present in dense/fused.ply or session)
+        dense_fused = session_dir / "dense" / "fused.ply"
+        if dense_fused.exists() and dense_fused.stat().st_size > 0:
+            artifacts["dense_fused_ply"] = "dense/fused.ply"
+
+        # 5. Trajectory Export
         traj_file = session_dir / "camera_trajectory.json"
         if self.export_camera_trajectory(colmap_sparse_dir, traj_file):
             artifacts["camera_trajectory"] = "camera_trajectory.json"
 
-        # 4. Thumbnail Generation
+        # 6. Thumbnail Generation
         thumb_file = session_dir / "thumbnail.png"
-        if self.generate_thumbnail(session_frames_dir, ply_file, thumb_file):
+        ref_ply = model_ply_file if model_ply_file.exists() else (ply_file or dense_fused)
+        if self.generate_thumbnail(session_frames_dir, ref_ply, thumb_file):
             artifacts["thumbnail"] = "thumbnail.png"
 
-        # 5. Gaussian Splat Asset (Standard 32-byte format)
-        splat_file = session_dir / "point_cloud.splat"
-        if splat_file.exists() and splat_file.stat().st_size > 0:
-            artifacts["point_cloud_splat"] = "point_cloud.splat"
-
         return artifacts
+

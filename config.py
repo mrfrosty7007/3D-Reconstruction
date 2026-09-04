@@ -65,8 +65,29 @@ class ColmapConfig:
 
 
 @dataclass
+class DenseConfig:
+    """Configuration for COLMAP MVS Dense Reconstruction (image_undistorter, patch_match_stereo, stereo_fusion)."""
+    max_image_size: int = 2000
+    gpu_index: str = "0"
+    window_radius: int = 5
+    num_samples: int = 15
+    num_iterations: int = 5
+    geom_consistency: bool = True
+    min_num_pixels: int = 5
+
+
+@dataclass
+class PoissonConfig:
+    """Configuration for Screened Poisson Surface Reconstruction."""
+    depth: int = 9  # Balance between speed and geometric detail (8-10)
+    density_trim_quantile: float = 0.05  # Trim low-density boundary artifacts
+    linear_fit: bool = False
+    export_formats: tuple = ("obj", "ply", "glb")
+
+
+@dataclass
 class GSplatConfig:
-    """Configuration for 3D Gaussian Splatting training."""
+    """[DEPRECATED] Retained for backwards compatibility."""
     iterations: int = 30_000
     learning_rate: float = 0.00016
     learning_rate_position: float = 0.00016
@@ -76,8 +97,8 @@ class GSplatConfig:
     densify_until_iter: int = 15_000
     prune_interval: int = 200
     sh_degree: int = 3
-    export_format: str = "ply"  # ply, splat, glb, obj
-    device: str = "cuda"  # cuda, cpu
+    export_format: str = "ply"
+    device: str = "cuda"
 
 
 @dataclass
@@ -92,7 +113,7 @@ class AppConfig:
     """Main application configuration container."""
     app_name: str = "TerraSweep"
     app_subtitle: str = "Drone & Mobile 3D Reconstruction Platform [SIH-26158]"
-    version: str = "1.1.0"
+    version: str = "2.0.0"
 
     # UI Theme Settings
     ui_appearance_mode: str = "Dark"  # "System", "Dark", "Light"
@@ -112,6 +133,8 @@ class AppConfig:
     # Subsystem configs
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     colmap: ColmapConfig = field(default_factory=ColmapConfig)
+    dense: DenseConfig = field(default_factory=DenseConfig)
+    poisson: PoissonConfig = field(default_factory=PoissonConfig)
     gsplat: GSplatConfig = field(default_factory=GSplatConfig)
     video: VideoConfig = field(default_factory=VideoConfig)
 

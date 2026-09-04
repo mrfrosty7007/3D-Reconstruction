@@ -1114,10 +1114,13 @@ class GeoReconApp(ctk.CTk):
 
         all_stages = [
             StageType.FRAME_EXTRACTION,
+            StageType.FILTER_FRAMES,
             StageType.COLMAP_FEATURES,
             StageType.COLMAP_MATCHING,
             StageType.COLMAP_MAPPER,
-            StageType.GAUSSIAN_SPLATTING,
+            StageType.DENSE_STEREO,
+            StageType.STEREO_FUSION,
+            StageType.POISSON_MESHING,
             StageType.EXPORT,
         ]
 
@@ -2035,14 +2038,14 @@ class GeoReconApp(ctk.CTk):
                 session_title = session_dir.name
 
         if session_dir and session_dir.exists():
-            for candidate in ["point_cloud.splat", "point_cloud.ply", "model.obj", "model.glb", "checkpoints/gaussians_model.npz"]:
+            for candidate in ["model.obj", "model.glb", "model.ply", "dense/fused.ply", "point_cloud.ply"]:
                 c_path = session_dir / candidate
                 if c_path.exists() and c_path.stat().st_size > 100:
                     proc = Model3DViewer.launch_viewer_process(c_path, f"TerraSweep Studio Viewer — {session_title}")
                     if proc is not None:
                         logger.info(f"Launched 3D viewer for {session_title} ({candidate})")
                         return
-            messagebox.showwarning("File Missing", f"3D model (point_cloud.splat / point_cloud.ply / model.obj / model.glb) not found in {session_title}")
+            messagebox.showwarning("File Missing", f"3D model (model.obj / model.glb / model.ply / dense/fused.ply) not found in {session_title}")
         else:
             messagebox.showwarning("No Model", "No completed 3D reconstruction model found for this session.")
 
@@ -2248,8 +2251,13 @@ class GeoReconApp(ctk.CTk):
             )
             return
 
-        src_path = session_dir / "point_cloud.ply"
-        if not src_path.exists() or src_path.stat().st_size == 0:
+        src_path = None
+        for cand in [session_dir / "model.ply", session_dir / "dense" / "fused.ply", session_dir / "point_cloud.ply"]:
+            if cand.exists() and cand.stat().st_size > 0:
+                src_path = cand
+                break
+
+        if src_path is None or not src_path.exists() or src_path.stat().st_size == 0:
             messagebox.showwarning(
                 "File Missing",
                 f"PLY was not generated for this reconstruction ({session_dir.name}).\n\n"
@@ -2632,6 +2640,8 @@ class GeoReconApp(ctk.CTk):
         if event.status == StageStatus.RUNNING:
             if event.stage == StageType.FRAME_EXTRACTION:
                 self.current_substate = "Extracting Keyframes"
+            elif event.stage == StageType.FILTER_FRAMES:
+                self.current_substate = "Filtering Blur & Duplicates"
             elif event.stage == StageType.COLMAP_FEATURES:
                 self.current_substate = "SIFT Feature Extraction (GPU)"
             elif event.stage == StageType.COLMAP_MATCHING:
@@ -2643,8 +2653,12 @@ class GeoReconApp(ctk.CTk):
                     self.current_substate = f"Registering Cameras ({event.registered_cameras}/{event.total_cameras})"
                 else:
                     self.current_substate = "Initializing Mapper & Seeds"
-            elif event.stage == StageType.GAUSSIAN_SPLATTING:
-                self.current_substate = "Training 3DGS (CUDA)"
+            elif event.stage == StageType.DENSE_STEREO:
+                self.current_substate = "Dense Stereo Depth (MVS CUDA)"
+            elif event.stage == StageType.STEREO_FUSION:
+                self.current_substate = "Stereo Fusion Point Cloud"
+            elif event.stage == StageType.POISSON_MESHING:
+                self.current_substate = "Screened Poisson Meshing"
             elif event.stage == StageType.EXPORT:
                 self.current_substate = "Packaging 3D Deliverables"
         elif event.status in (StageStatus.FAILED, StageStatus.COMPLETED, StageStatus.SKIPPED):
@@ -2894,7 +2908,7 @@ class GeoReconApp(ctk.CTk):
         if not hasattr(self, "telemetry_card") or not hasattr(self, "lbl_hw_stage_mode"):
             return
 
-        if stage in (StageType.COLMAP_FEATURES, StageType.COLMAP_MATCHING, StageType.GAUSSIAN_SPLATTING):
+        if stage in (StageType.COLMAP_FEATURES, StageType.COLMAP_MATCHING, StageType.DENSE_STEREO, StageType.GAUSSIAN_SPLATTING):
             # GPU Subsystem Highlighted (Electric Cyan / Blue)
             self.telemetry_card.configure(border_color="#0284C7", border_width=1.5)
             self.lbl_hw_stage_mode.configure(
@@ -2903,7 +2917,7 @@ class GeoReconApp(ctk.CTk):
             )
             self.bar_hw_gpu.configure(progress_color="#38BDF8")
             self.bar_hw_cpu.configure(progress_color="#475569")
-        elif stage == StageType.COLMAP_MAPPER:
+        elif stage in (StageType.COLMAP_MAPPER, StageType.STEREO_FUSION, StageType.POISSON_MESHING):
             # CPU Subsystem Highlighted (Amber / Orange)
             self.telemetry_card.configure(border_color="#F59E0B", border_width=1.5)
             self.lbl_hw_stage_mode.configure(
@@ -3057,6 +3071,10 @@ class GeoReconApp(ctk.CTk):
         gauss_count = 0
         train_time_s = 0.0
 
+        triangles_cnt = 0
+        vertices_cnt = 0
+        dense_pts = 0
+
         # Priority 1: Read from scene_manifest.json (Single Source of Truth)
         if (session_output_dir / "scene_manifest.json").exists():
             try:
@@ -3067,9 +3085,9 @@ class GeoReconApp(ctk.CTk):
                     reg_pct = m_data.get("registration_percentage", m_data.get("colmap_sfm", {}).get("registration_percentage", 100.0))
                     points_count = m_data.get("sparse_points", m_data.get("colmap_sfm", {}).get("sparse_3d_points", 0))
                     reproj_err = m_data.get("reprojection_error", m_data.get("colmap_sfm", {}).get("reprojection_error", 0.015))
-                    psnr_val = m_data.get("psnr", m_data.get("gaussian_splatting", {}).get("final_psnr", 33.4))
-                    gauss_count = m_data.get("gaussians", m_data.get("gaussian_splatting", {}).get("clean_gaussians", 0))
-                    train_time_s = m_data.get("training_seconds", m_data.get("gaussian_splatting", {}).get("training_time_seconds", 0.0))
+                    dense_pts = m_data.get("dense_points", m_data.get("dense_reconstruction", {}).get("dense_points", 0))
+                    triangles_cnt = m_data.get("triangles", m_data.get("poisson_mesh", {}).get("triangles", 0))
+                    vertices_cnt = m_data.get("vertices", m_data.get("poisson_mesh", {}).get("vertices", 0))
                     device_name = m_data.get("gpu_used", m_data.get("colmap_sfm", {}).get("device", "NVIDIA CUDA GPU"))
             except Exception:
                 pass
@@ -3083,13 +3101,7 @@ class GeoReconApp(ctk.CTk):
             reproj_err = colmap_summary.mean_reprojection_error
             device_name = colmap_summary.device
 
-        if gsplat_res and (gauss_count == 0 or train_time_s == 0.0):
-            psnr_val = gsplat_res.final_psnr
-            gauss_count = gsplat_res.final_gaussian_count
-            train_time_s = gsplat_res.training_time_seconds
-            device_name = getattr(gsplat_res, "device_used", device_name)
-
-        # Priority 3: Fallback parsing colmap_summary.json & checkpoint_final.json
+        # Priority 3: Fallback parsing colmap_summary.json
         if points_count == 0 and (session_output_dir / "colmap_summary.json").exists():
             try:
                 with open(session_output_dir / "colmap_summary.json", "r", encoding="utf-8") as f:
@@ -3103,36 +3115,35 @@ class GeoReconApp(ctk.CTk):
             except Exception:
                 pass
 
-        if gauss_count == 0 and (session_output_dir / "checkpoints" / "checkpoint_final.json").exists():
-            try:
-                with open(session_output_dir / "checkpoints" / "checkpoint_final.json", "r", encoding="utf-8") as f:
-                    ck_data = json.load(f)
-                    psnr_val = ck_data.get("final_psnr", psnr_val)
-                    gauss_count = ck_data.get("gaussian_count", gauss_count)
-                    train_time_s = ck_data.get("training_time_seconds", train_time_s)
-            except Exception:
-                pass
-
-        if gauss_count == 0 and points_count > 0:
-            gauss_count = points_count
-
         # Update Top 4 Metric Cards
         self.fin_card_scene.configure(text=session_name)
-        self.fin_card_psnr.configure(text=f"{psnr_val:.1f} dB (High Fidelity)")
+        if triangles_cnt > 0:
+            self.fin_card_psnr.configure(text=f"{triangles_cnt:,} Triangles (Watertight)")
+        else:
+            self.fin_card_psnr.configure(text=f"{points_count:,} Points")
         self.fin_card_cams.configure(text=f"{reg_cams}/{tot_cams} ({reg_pct}%)")
 
         score = min(100, int(reg_pct * 0.95 + 5))
         self.fin_card_health.configure(text=f"{score}/100")
 
         # Cleanup text
-        clean_txt = (
-            f"• Registered Cameras: {reg_cams}/{tot_cams} ({reg_pct}%)\n"
-            f"• Sparse Tie Points: {points_count:,}\n"
-            f"• Clean 3D Gaussians: {gauss_count:,}\n"
-            f"• 3DGS Optimization Time: {train_time_s:.1f}s\n"
-            f"• Mean Reprojection Error: {reproj_err} px\n"
-            f"• Hardware Device: {device_name}"
-        )
+        if triangles_cnt > 0:
+            clean_txt = (
+                f"• Registered Cameras: {reg_cams}/{tot_cams} ({reg_pct}%)\n"
+                f"• Sparse SfM Points: {points_count:,}\n"
+                f"• Dense MVS Points: {dense_pts:,}\n"
+                f"• Poisson Mesh Triangles: {triangles_cnt:,}\n"
+                f"• Poisson Mesh Vertices: {vertices_cnt:,}\n"
+                f"• Mean Reprojection Error: {reproj_err} px\n"
+                f"• Hardware Device: {device_name}"
+            )
+        else:
+            clean_txt = (
+                f"• Registered Cameras: {reg_cams}/{tot_cams} ({reg_pct}%)\n"
+                f"• Sparse Tie Points: {points_count:,}\n"
+                f"• Mean Reprojection Error: {reproj_err} px\n"
+                f"• Hardware Device: {device_name}"
+            )
         self.lbl_fin_clean_metrics.configure(text=clean_txt)
 
         # Georeferencing label

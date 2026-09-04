@@ -17,6 +17,7 @@ from pipeline.video_processor import VideoProcessor, VideoMetadata
 from pipeline.blur_filter import BlurFilter, BlurFilterResult
 from pipeline.duplicate_filter import DuplicateFilter, DuplicateFilterResult
 from pipeline.colmap_runner import ColmapRunner, ColmapSummary
+from pipeline.poisson_mesher import PoissonMesher, PoissonResult
 from pipeline.gsplat_runner import GSplatRunner, GSplatTrainingResult
 from pipeline.exporter import ModelExporter
 from pipeline.viewer import Model3DViewer, run_open3d_viewer
@@ -44,6 +45,8 @@ __all__ = [
     "DuplicateFilterResult",
     "ColmapRunner",
     "ColmapSummary",
+    "PoissonMesher",
+    "PoissonResult",
     "GSplatRunner",
     "GSplatTrainingResult",
     "ModelExporter",

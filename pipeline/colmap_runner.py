@@ -19,6 +19,8 @@ import threading
 import time
 from typing import Callable, Dict, Any, List, Optional, Tuple
 
+import numpy as np
+
 from config import ColmapConfig
 
 logger = logging.getLogger("GeoRecon.COLMAP")
@@ -567,7 +569,7 @@ class ColmapRunner:
         on_log: Optional[Callable[[str], None]] = None,
         stop_event: Optional[threading.Event] = None,
     ) -> bool:
-        """Stage 4: Converts binary COLMAP model (BIN) to readable text format (TXT)."""
+        """Converts binary COLMAP model (BIN) to readable text format (TXT)."""
         output_txt_dir.mkdir(parents=True, exist_ok=True)
 
         args = [
@@ -577,6 +579,127 @@ class ColmapRunner:
             "--output_type", "TXT",
         ]
         return self._run_colmap_command(args, "COLMAP-ModelConverter", on_log, stop_event)
+
+    def run_image_undistorter(
+        self,
+        image_path: Path,
+        input_model_dir: Path,
+        output_dense_dir: Path,
+        max_image_size: int = 2000,
+        on_log: Optional[Callable[[str], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Runs COLMAP image_undistorter to prepare undistorted images and calibration for MVS."""
+        output_dense_dir.mkdir(parents=True, exist_ok=True)
+        opt_threads = str(self.get_optimal_thread_count())
+
+        args = [
+            "image_undistorter",
+            "--image_path", str(image_path),
+            "--input_path", str(input_model_dir),
+            "--output_path", str(output_dense_dir),
+            "--output_type", "COLMAP",
+            "--max_image_size", str(max_image_size),
+            "--num_threads", opt_threads,
+        ]
+        return self._run_colmap_command(args, "COLMAP-Undistorter", on_log, stop_event)
+
+    def run_patch_match_stereo(
+        self,
+        workspace_path: Path,
+        max_image_size: int = 2000,
+        gpu_index: str = "0",
+        use_gpu: bool = True,
+        on_log: Optional[Callable[[str], None]] = None,
+        on_view_progress: Optional[Callable[[int, int], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Runs COLMAP patch_match_stereo with CUDA GPU acceleration for dense depth & normal estimation."""
+        gpu_enabled = use_gpu and self.is_gpu_available()
+        gpu_idx_val = str(gpu_index) if gpu_enabled else "-1"
+        opt_threads = str(self.get_optimal_thread_count())
+
+        args = [
+            "patch_match_stereo",
+            "--workspace_path", str(workspace_path),
+            "--workspace_format", "COLMAP",
+            "--PatchMatchStereo.gpu_index", gpu_idx_val,
+            "--PatchMatchStereo.max_image_size", str(max_image_size),
+            "--PatchMatchStereo.geom_consistency", "1",
+            "--PatchMatchStereo.num_threads", opt_threads,
+        ]
+
+        def _log_with_view_tracking(line: str):
+            if on_log:
+                on_log(line)
+            match_view = re.search(r"Processing view\s+(\d+)\s*/\s*(\d+)", line, re.IGNORECASE)
+            if match_view and on_view_progress:
+                try:
+                    cur_v = int(match_view.group(1))
+                    tot_v = int(match_view.group(2))
+                    on_view_progress(cur_v, tot_v)
+                except ValueError:
+                    pass
+
+        return self._run_colmap_command(
+            args=args,
+            stage_name="COLMAP-PatchMatchStereo",
+            on_log=_log_with_view_tracking,
+            stop_event=stop_event,
+        )
+
+    def run_stereo_fusion(
+        self,
+        workspace_path: Path,
+        output_ply_path: Path,
+        min_num_pixels: int = 5,
+        on_log: Optional[Callable[[str], None]] = None,
+        on_view_progress: Optional[Callable[[int, int], None]] = None,
+        on_fused_points: Optional[Callable[[int], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Runs COLMAP stereo_fusion to generate dense fused point cloud (dense/fused.ply)."""
+        output_ply_path.parent.mkdir(parents=True, exist_ok=True)
+        opt_threads = str(self.get_optimal_thread_count())
+
+        args = [
+            "stereo_fusion",
+            "--workspace_path", str(workspace_path),
+            "--workspace_format", "COLMAP",
+            "--input_type", "geometric",
+            "--output_type", "PLY",
+            "--output_path", str(output_ply_path),
+            "--StereoFusion.min_num_pixels", str(min_num_pixels),
+            "--StereoFusion.num_threads", opt_threads,
+        ]
+
+        def _log_with_fusion_tracking(line: str):
+            if on_log:
+                on_log(line)
+            match_view = re.search(r"Processing view\s+(\d+)\s*/\s*(\d+)", line, re.IGNORECASE)
+            if match_view and on_view_progress:
+                try:
+                    cur_v = int(match_view.group(1))
+                    tot_v = int(match_view.group(2))
+                    on_view_progress(cur_v, tot_v)
+                except ValueError:
+                    pass
+            match_pts = re.search(r"Number of fused points:\s*(\d+)", line, re.IGNORECASE)
+            if match_pts and on_fused_points:
+                try:
+                    pts = int(match_pts.group(1))
+                    on_fused_points(pts)
+                except ValueError:
+                    pass
+
+        ok = self._run_colmap_command(
+            args=args,
+            stage_name="COLMAP-StereoFusion",
+            on_log=_log_with_fusion_tracking,
+            stop_event=stop_event,
+        )
+
+        return ok and output_ply_path.exists() and output_ply_path.stat().st_size > 0
 
     @staticmethod
     def find_best_model_dir(sparse_dir: Path) -> Tuple[Path, int, int]:
@@ -727,3 +850,157 @@ class ColmapRunner:
 
         summary.is_valid = (summary.registered_cameras > 0 or has_bin)
         return summary
+
+    @staticmethod
+    def load_colmap_points(model_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
+        """Parses points3D.bin or points3D.txt (xyz [N,3], rgb [N,3] 0..255)."""
+        pts_list: List[List[float]] = []
+        cols_list: List[List[int]] = []
+
+        bin_file = model_dir / "points3D.bin"
+        if bin_file.exists():
+            try:
+                with open(bin_file, "rb") as f:
+                    num_points = struct.unpack("<Q", f.read(8))[0]
+                    for _ in range(num_points):
+                        _ = struct.unpack("<Q", f.read(8))[0]  # id
+                        x, y, z = struct.unpack("<3d", f.read(24))
+                        r, g, b = struct.unpack("<3B", f.read(3))
+                        _ = struct.unpack("<d", f.read(8))[0]  # error
+                        track_len = struct.unpack("<Q", f.read(8))[0]
+                        f.seek(track_len * 8, 1)
+                        pts_list.append([x, y, z])
+                        cols_list.append([r, g, b])
+                if pts_list:
+                    return np.array(pts_list, dtype=np.float32), np.array(cols_list, dtype=np.uint8)
+            except Exception as e:
+                logger.debug(f"Binary points parse fallback: {e}")
+
+        txt_file = model_dir / "txt" / "points3D.txt" if (model_dir / "txt" / "points3D.txt").exists() else model_dir / "points3D.txt"
+        if txt_file.exists():
+            try:
+                with open(txt_file, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            parts = line.split()
+                            if len(parts) >= 7:
+                                pts_list.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                                cols_list.append([int(parts[4]), int(parts[5]), int(parts[6])])
+                if pts_list:
+                    return np.array(pts_list, dtype=np.float32), np.array(cols_list, dtype=np.uint8)
+            except Exception as e:
+                logger.debug(f"Text points parse fallback: {e}")
+
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
+    @staticmethod
+    def load_colmap_cameras(model_dir: Path) -> Dict[int, Dict[str, Any]]:
+        """Parses cameras.bin or cameras.txt."""
+        cameras = {}
+        bin_file = model_dir / "cameras.bin"
+        if bin_file.exists():
+            try:
+                with open(bin_file, "rb") as f:
+                    num_cams = struct.unpack("<Q", f.read(8))[0]
+                    for _ in range(num_cams):
+                        cam_id = struct.unpack("<i", f.read(4))[0]
+                        model_id = struct.unpack("<i", f.read(4))[0]
+                        width = struct.unpack("<Q", f.read(8))[0]
+                        height = struct.unpack("<Q", f.read(8))[0]
+                        params_map = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8}
+                        num_params = params_map.get(model_id, 4)
+                        params = struct.unpack(f"<{num_params}d", f.read(num_params * 8))
+                        cameras[cam_id] = {
+                            "camera_id": cam_id,
+                            "model_id": model_id,
+                            "width": width,
+                            "height": height,
+                            "params": params,
+                        }
+                if cameras:
+                    return cameras
+            except Exception as e:
+                logger.debug(f"Binary cameras parse fallback: {e}")
+
+        txt_file = model_dir / "txt" / "cameras.txt" if (model_dir / "txt" / "cameras.txt").exists() else model_dir / "cameras.txt"
+        if txt_file.exists():
+            try:
+                with open(txt_file, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            parts = line.split()
+                            if len(parts) >= 5:
+                                cam_id = int(parts[0])
+                                cameras[cam_id] = {
+                                    "camera_id": cam_id,
+                                    "model": parts[1],
+                                    "width": int(parts[2]),
+                                    "height": int(parts[3]),
+                                    "params": [float(p) for p in parts[4:]],
+                                }
+            except Exception as e:
+                logger.debug(f"Text cameras parse fallback: {e}")
+
+        return cameras
+
+    @staticmethod
+    def load_colmap_images(model_dir: Path) -> Dict[int, Dict[str, Any]]:
+        """Parses images.bin or images.txt."""
+        images = {}
+        bin_file = model_dir / "images.bin"
+        if bin_file.exists():
+            try:
+                with open(bin_file, "rb") as f:
+                    num_images = struct.unpack("<Q", f.read(8))[0]
+                    for _ in range(num_images):
+                        img_id = struct.unpack("<I", f.read(4))[0]
+                        qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
+                        tx, ty, tz = struct.unpack("<3d", f.read(24))
+                        cam_id = struct.unpack("<I", f.read(4))[0]
+                        chars = []
+                        while True:
+                            c = f.read(1)
+                            if c == b"\x00" or not c:
+                                break
+                            chars.append(c.decode("latin1", errors="ignore"))
+                        img_name = "".join(chars)
+                        num_pts2d = struct.unpack("<Q", f.read(8))[0]
+                        f.seek(num_pts2d * 24, 1)
+                        images[img_id] = {
+                            "image_id": img_id,
+                            "qvec": np.array([qw, qx, qy, qz], dtype=np.float32),
+                            "tvec": np.array([tx, ty, tz], dtype=np.float32),
+                            "camera_id": cam_id,
+                            "name": img_name,
+                        }
+                if images:
+                    return images
+            except Exception as e:
+                logger.debug(f"Binary images parse fallback: {e}")
+
+        txt_file = model_dir / "txt" / "images.txt" if (model_dir / "txt" / "images.txt").exists() else model_dir / "images.txt"
+        if txt_file.exists():
+            try:
+                with open(txt_file, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            parts = line.split()
+                            if len(parts) >= 9 and ("." in parts[-1]):
+                                img_id = int(parts[0])
+                                qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                                tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
+                                images[img_id] = {
+                                    "image_id": img_id,
+                                    "qvec": np.array([qw, qx, qy, qz], dtype=np.float32),
+                                    "tvec": np.array([tx, ty, tz], dtype=np.float32),
+                                    "camera_id": int(parts[8]),
+                                    "name": parts[9] if len(parts) > 9 else parts[-1],
+                                }
+            except Exception as e:
+                logger.debug(f"Text images parse fallback: {e}")
+
+        return images
+

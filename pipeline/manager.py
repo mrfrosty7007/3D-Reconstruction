@@ -1,13 +1,16 @@
 """
 GeoRecon AI - Studio Pipeline Manager
-Coordinates the complete end-to-end 6-stage photogrammetry and 3D Gaussian Splatting pipeline:
-1. Extract Frames (Video + Blur + Duplicate Filter)
-2. COLMAP Features (SIFT Extraction)
-3. Feature Matching (Exhaustive/Sequential Matcher)
-4. Sparse Reconstruction (Incremental Mapper + Model Conversion)
+Coordinates the complete end-to-end 9-stage photogrammetry and Screened Poisson Mesh pipeline:
+1. Extract Frames (Video Ingestion)
+2. Filter Frames (Blur + Duplicate Filtering)
+3. COLMAP Features (SIFT Extraction)
+4. Feature Matching (Exhaustive/Sequential Matcher)
+5. Sparse Reconstruction (Incremental Mapper + Model Conversion)
    -> Reconstruction Quality Gate (Green / Yellow / Red validation)
-5. Training Gaussian Splatting (3DGS Optimization + Live Telemetry)
-6. Exporting Model (Multi-format PLY, OBJ, GLB, Trajectory & Manifests)
+6. Dense Stereo (image_undistorter + patch_match_stereo)
+7. Stereo Fusion (Multi-view Depth Fusion -> dense/fused.ply)
+8. Poisson Meshing (Open3D Screened Poisson Surface Reconstruction -> OBJ, PLY, GLB)
+9. Export Assets (Deliverables packaging, camera trajectory, thumbnail, manifests)
 """
 
 from datetime import datetime
@@ -26,7 +29,7 @@ from pipeline.video_processor import VideoProcessor, VideoMetadata
 from pipeline.blur_filter import BlurFilter, BlurFilterResult
 from pipeline.duplicate_filter import DuplicateFilter, DuplicateFilterResult
 from pipeline.colmap_runner import ColmapRunner, ColmapSummary
-from pipeline.gsplat_runner import GSplatRunner, GSplatTrainingResult
+from pipeline.poisson_mesher import PoissonMesher, PoissonResult
 from pipeline.exporter import ModelExporter
 from pipeline.viewer import Model3DViewer
 from pipeline.telemetry import HardwareSnapshot, HardwareTelemetryCollector
@@ -45,8 +48,8 @@ def infer_session_status(session_dir: Path) -> str:
     """
     Safely resolves the pipeline status for a session directory.
     Single Source of Truth: scene_manifest.json ('pipeline_status').
-    Backward compatibility for legacy sessions:
-    - If checkpoint_final.json, point_cloud.ply, trajectory_preview.mp4 all exist -> 'completed'
+    Backward compatibility for sessions:
+    - If model.obj, model.glb, or model.ply exists (with trajectory or manifest) -> 'completed'
     - Else if colmap_summary.json shows proceed == false (or quality gate failed) -> 'failed'
     - Otherwise -> 'partial'
     """
@@ -64,11 +67,13 @@ def infer_session_status(session_dir: Path) -> str:
         except Exception:
             pass
 
-    # Legacy inference rules
-    ckpt_p = session_dir / "checkpoints" / "checkpoint_final.json"
-    ply_p = session_dir / "point_cloud.ply"
+    # Deliverables inference rules
+    obj_p = session_dir / "model.obj"
+    glb_p = session_dir / "model.glb"
+    ply_p = session_dir / "model.ply"
+    old_ply = session_dir / "point_cloud.ply"
     traj_p = session_dir / "trajectory_preview.mp4"
-    if ckpt_p.exists() and ply_p.exists() and traj_p.exists():
+    if (obj_p.exists() or glb_p.exists() or ply_p.exists() or old_ply.exists()) and traj_p.exists():
         return PIPELINE_STATUS_COMPLETED
 
     colmap_p = session_dir / "colmap_summary.json"
@@ -118,7 +123,7 @@ class ETATracker:
         """Estimates remaining time during Sparse Reconstruction."""
         rem_cams = max(0, total - registered)
         if rem_cams == 0:
-            return 30.0  # Estimated ~25s GSplat + ~5s Export
+            return 45.0  # Estimated ~25s Dense + ~15s Poisson + ~5s Export
 
         speed = 0.0
         if len(self.reg_cam_history) >= 2:
@@ -131,18 +136,30 @@ class ETATracker:
             speed = 1.5  # Typical registration speed: ~1.5 cams/s
 
         mapper_rem_s = rem_cams / max(0.2, speed)
-        total_rem_s = mapper_rem_s + 30.0  # + GSplat and Export
+        total_rem_s = mapper_rem_s + 45.0  # + Dense Stereo, Fusion, Poisson, Export
         if self.last_estimated_eta is not None:
             total_rem_s = 0.7 * total_rem_s + 0.3 * self.last_estimated_eta
         self.last_estimated_eta = max(5.0, total_rem_s)
         return self.last_estimated_eta
 
+    def estimate_eta_dense(self, current_stage_prog: float, stage_idx: int) -> float:
+        """Estimates remaining time during Dense Reconstruction & Poisson Meshing."""
+        stage_weights = {6: 25.0, 7: 15.0, 8: 15.0, 9: 5.0}
+        rem = 0.0
+        for s, w in stage_weights.items():
+            if s == stage_idx:
+                rem += w * max(0.0, 1.0 - current_stage_prog)
+            elif s > stage_idx:
+                rem += w
+        self.last_estimated_eta = max(1.0, rem)
+        return self.last_estimated_eta
+
     def estimate_eta_gsplat(self, current_iter: int, total_iter: int, iter_speed: float) -> float:
-        """Estimates remaining time during Gaussian Splatting."""
+        """[DEPRECATED] Compatibility alias for legacy tests."""
         rem_iters = max(0, total_iter - current_iter)
         speed = max(1.0, iter_speed)
         gsplat_rem = rem_iters / speed
-        total_rem = gsplat_rem + 5.0  # + Export
+        total_rem = gsplat_rem + 5.0
         self.last_estimated_eta = max(1.0, total_rem)
         return self.last_estimated_eta
 
@@ -183,8 +200,9 @@ class PipelineManager:
             max_features=config.preprocess.orb_max_features,
         )
         self.colmap_runner = ColmapRunner(config.colmap)
-        self.gsplat_runner = GSplatRunner(config.gsplat)
-        self.exporter = ModelExporter(config.gsplat.export_format)
+        self.poisson_mesher = PoissonMesher(config.poisson)
+        self.gsplat_runner = None  # Deprecated
+        self.exporter = ModelExporter("obj")
 
         # Threading state
         self._worker_thread: Optional[threading.Thread] = None
@@ -197,7 +215,9 @@ class PipelineManager:
         # Session cache
         self.last_session_name: Optional[str] = None
         self.last_colmap_summary: Optional[ColmapSummary] = None
-        self.last_gsplat_result: Optional[GSplatTrainingResult] = None
+        self.last_poisson_result: Optional[PoissonResult] = None
+        self.last_dense_ply: Optional[Path] = None
+        self.last_gsplat_result: Optional[Any] = None
 
         # Live Hardware Telemetry Collector
         self.telemetry_collector = HardwareTelemetryCollector(interval_seconds=0.5)
@@ -285,7 +305,7 @@ class PipelineManager:
         """Signals worker thread to proceed past Yellow Quality Gate into Stage 5."""
         if hasattr(self, "_quality_gate_override_event"):
             self._quality_gate_override_event.set()
-            logger.info("Quality Gate override signal sent: User confirmed continuation to 3DGS.")
+            logger.info("Quality Gate override signal sent: User confirmed continuation to Dense Reconstruction.")
 
     def write_diagnostics(
         self,
@@ -440,7 +460,7 @@ class PipelineManager:
         if sparse_dir and sparse_dir.exists() and not ply_file.exists():
             try:
                 best_dir, _, _ = ColmapRunner.find_best_model_dir(sparse_dir)
-                points_xyz, points_rgb = GSplatRunner.load_colmap_points(best_dir)
+                points_xyz, points_rgb = ColmapRunner.load_colmap_points(best_dir)
                 if len(points_xyz) > 0:
                     ModelExporter.export_ply_point_cloud(points_xyz, points_rgb, ply_file)
             except Exception as e:
@@ -522,20 +542,26 @@ class PipelineManager:
         session_colmap_dir = session_data_dir / "colmap"
         database_path = session_colmap_dir / "database.db"
         sparse_dir = session_colmap_dir / "sparse"
+        dense_workspace_dir = session_colmap_dir / "dense"
         session_output_dir = output_dir / session_name
+        session_output_dense_dir = session_output_dir / "dense"
 
         session_frames_dir.mkdir(parents=True, exist_ok=True)
         session_colmap_dir.mkdir(parents=True, exist_ok=True)
         sparse_dir.mkdir(parents=True, exist_ok=True)
+        dense_workspace_dir.mkdir(parents=True, exist_ok=True)
         session_output_dir.mkdir(parents=True, exist_ok=True)
+        session_output_dense_dir.mkdir(parents=True, exist_ok=True)
 
         total_cameras = 0
         registered_cameras = 0
         sparse_points = 0
+        dense_points = 0
         quality_score = 0
         current_stage = 0
         quality_gate_passed = False
         colmap_summary: Optional[ColmapSummary] = None
+        poisson_res: Optional[PoissonResult] = None
         manifest_written = False
 
         # Reset telemetry peaks for this session
@@ -554,7 +580,7 @@ class PipelineManager:
 
         try:
             logger.info("=" * 75)
-            logger.info(f"🌐 TerraSweep Studio — 3DGS Reconstruction Session [{session_name}]")
+            logger.info(f"🌐 TerraSweep Studio — COLMAP MVS + Poisson Mesh Session [{session_name}]")
             logger.info(f"Input Video: {video_path}")
             logger.info(f"Frames Path: {session_frames_dir}")
             logger.info("Output Path: %s", session_output_dir)
@@ -564,89 +590,111 @@ class PipelineManager:
             self.colmap_runner.verify_gpu_flags()
 
             # =========================================================
-            # STAGE 1: Extract Frames (Video + Blur + Duplicate Filter)
+            # STAGE 1: Extract Frames (Video Ingestion)
             # =========================================================
             if self._stop_event.is_set():
                 self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 0, False, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_1_FRAMES")
                 manifest_written = True
                 return
-            frames_dataset, video_meta, blur_res, dup_res = self._execute_stage_1_frames(
-                video_path, session_frames_dir, session_output_dir, session_name
+            extracted_paths, video_meta = self._execute_stage_1_frames(
+                video_path, session_frames_dir
             )
             if self._stop_event.is_set():
                 self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 0, False, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_1_FRAMES")
                 manifest_written = True
                 return
-            if not frames_dataset:
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 0, False, failure_reason="Stage 1 failed: No clean frames extracted from video.", stage_name_str="STAGE_1_FRAMES")
+            if not extracted_paths:
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 0, False, failure_reason="Stage 1 failed: No frames extracted from video.", stage_name_str="STAGE_1_FRAMES")
                 manifest_written = True
                 return
 
-            total_cameras = len(frames_dataset)
             current_stage = 1
             self._last_stage_name = "STAGE_1_FRAMES"
 
             # =========================================================
-            # STAGE 2: COLMAP Features (SIFT Feature Extraction)
+            # STAGE 2: Filter Frames (Blur + Duplicate Filtering)
             # =========================================================
             if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 1, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_2_FEATURES")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 1, False, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_2_FILTER")
                 manifest_written = True
                 return
-            feat_ok = self._execute_stage_2_features(session_frames_dir, database_path)
+            frames_dataset, blur_res, dup_res = self._execute_stage_2_filter_frames(
+                extracted_paths, session_output_dir, session_name, video_meta
+            )
             if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 1, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_2_FEATURES")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 1, False, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_2_FILTER")
+                manifest_written = True
+                return
+            if not frames_dataset:
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 1, False, failure_reason="Stage 2 failed: All frames were filtered as blurry or duplicate.", stage_name_str="STAGE_2_FILTER")
+                manifest_written = True
+                return
+
+            total_cameras = len(frames_dataset)
+            current_stage = 2
+            self._last_stage_name = "STAGE_2_FILTER"
+
+            # =========================================================
+            # STAGE 3: COLMAP Features (SIFT Feature Extraction)
+            # =========================================================
+            if self._stop_event.is_set():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 2, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_3_FEATURES")
+                manifest_written = True
+                return
+            feat_ok = self._execute_stage_3_features(session_frames_dir, database_path)
+            if self._stop_event.is_set():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 2, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_3_FEATURES")
                 manifest_written = True
                 return
             if not feat_ok:
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 1, False, total_cameras=total_cameras, failure_reason="Stage 2 failed: COLMAP SIFT feature extraction failed.", stage_name_str="STAGE_2_FEATURES")
-                manifest_written = True
-                return
-            current_stage = 2
-            self._last_stage_name = "STAGE_2_FEATURES"
-
-            # =========================================================
-            # STAGE 3: Feature Matching (Exhaustive Matcher)
-            # =========================================================
-            if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 2, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_3_MATCHING")
-                manifest_written = True
-                return
-            match_ok = self._execute_stage_3_matching(database_path)
-            if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 2, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_3_MATCHING")
-                manifest_written = True
-                return
-            if not match_ok:
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 2, False, total_cameras=total_cameras, failure_reason="Stage 3 failed: COLMAP feature matching failed.", stage_name_str="STAGE_3_MATCHING")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 2, False, total_cameras=total_cameras, failure_reason="Stage 3 failed: COLMAP SIFT feature extraction failed.", stage_name_str="STAGE_3_FEATURES")
                 manifest_written = True
                 return
             current_stage = 3
-            self._last_stage_name = "STAGE_3_MATCHING"
+            self._last_stage_name = "STAGE_3_FEATURES"
 
             # =========================================================
-            # STAGE 4: Sparse Reconstruction (Incremental Mapper + TXT)
+            # STAGE 4: Feature Matching (Exhaustive Matcher)
             # =========================================================
             if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 3, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_4_MAPPER")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 3, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_4_MATCHING")
                 manifest_written = True
                 return
-            colmap_summary = self._execute_stage_4_mapper(
+            match_ok = self._execute_stage_4_matching(database_path)
+            if self._stop_event.is_set():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 3, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_4_MATCHING")
+                manifest_written = True
+                return
+            if not match_ok:
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 3, False, total_cameras=total_cameras, failure_reason="Stage 4 failed: COLMAP feature matching failed.", stage_name_str="STAGE_4_MATCHING")
+                manifest_written = True
+                return
+            current_stage = 4
+            self._last_stage_name = "STAGE_4_MATCHING"
+
+            # =========================================================
+            # STAGE 5: Sparse Reconstruction (Incremental Mapper + TXT)
+            # =========================================================
+            if self._stop_event.is_set():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 4, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_5_MAPPER")
+                manifest_written = True
+                return
+            colmap_summary = self._execute_stage_5_mapper(
                 session_frames_dir, database_path, sparse_dir, total_cameras, session_name, session_output_dir
             )
             if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 3, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_4_MAPPER")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 4, False, total_cameras=total_cameras, failure_reason="Reconstruction cancelled by user.", stage_name_str="STAGE_5_MAPPER")
                 manifest_written = True
                 return
             if not colmap_summary or not colmap_summary.is_valid:
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 3, False, total_cameras=total_cameras, failure_reason="Stage 4 failed: COLMAP mapper failed to reconstruct sparse model.", stage_name_str="STAGE_4_MAPPER")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 4, False, total_cameras=total_cameras, failure_reason="Stage 5 failed: COLMAP mapper failed to reconstruct sparse model.", stage_name_str="STAGE_5_MAPPER")
                 manifest_written = True
                 return
 
             self.last_colmap_summary = colmap_summary
             registered_cameras = colmap_summary.registered_cameras
             sparse_points = colmap_summary.sparse_point_count
-            current_stage = 4
+            current_stage = 5
             self._last_stage_name = "COLMAP_MAPPER"
             self._last_reg_cams = registered_cameras
 
@@ -660,20 +708,20 @@ class PipelineManager:
 
             if quality_level == "GREEN":
                 # Green (>=40%): Continue automatically
-                logger.info(f"Quality Gate: GREEN (≥40%). Automatically proceeding to 3D Gaussian Splatting ({colmap_summary.registration_percentage:.1f}% registered).")
+                logger.info(f"Quality Gate: GREEN (≥40%). Proceeding automatically to Dense MVS ({colmap_summary.registration_percentage:.1f}% registered).")
                 quality_gate_passed = True
                 self.emit_event(
                     stage=StageType.COLMAP_MAPPER,
                     status=StageStatus.COMPLETED,
                     progress=1.0,
-                    message=f"Quality Gate: High Confidence (≥40%). Auto-proceeding to 3DGS.",
+                    message=f"Quality Gate: High Confidence (≥40%). Proceeding to Dense Stereo.",
                     quality_score=quality_score,
                     total_cameras=total_cameras,
                     registered_cameras=registered_cameras,
                     sparse_points=sparse_points,
                     metrics={
                         "QualityLevel": "GREEN",
-                        "Action": "Auto-Continue to 3DGS",
+                        "Action": "Auto-Continue to Dense Stereo",
                     },
                 )
 
@@ -707,7 +755,7 @@ class PipelineManager:
                             session_output_dir=session_output_dir,
                             session_name=session_name,
                             pipeline_status=st,
-                            stage_num=4,
+                            stage_num=5,
                             gate_passed=False,
                             registered_cameras=registered_cameras,
                             total_cameras=total_cameras,
@@ -720,17 +768,17 @@ class PipelineManager:
                         return
 
                 quality_gate_passed = True
-                logger.info("Quality Gate Yellow: User confirmed continuation. Proceeding to Stage 5...")
+                logger.info("Quality Gate Yellow: User confirmed continuation. Proceeding to Stage 6...")
 
             else:
-                # Red (<20%): Stop before GSplat, mark reconstruction as failed, recommend retry settings
+                # Red (<20%): Stop before Dense MVS, mark reconstruction as failed
                 failure_msg = f"Quality Gate Failed: Only {registered_cameras}/{total_cameras} cameras registered ({colmap_summary.registration_percentage:.1f}% < 20%)."
                 logger.error(f"Reconstruction Quality Gate [RED]: {failure_msg}")
                 self._save_session_outcome(
                     session_output_dir=session_output_dir,
                     session_name=session_name,
                     pipeline_status=PIPELINE_STATUS_FAILED,
-                    stage_num=4,
+                    stage_num=5,
                     gate_passed=False,
                     registered_cameras=registered_cameras,
                     total_cameras=total_cameras,
@@ -744,7 +792,7 @@ class PipelineManager:
                     stage=StageType.COLMAP_MAPPER,
                     status=StageStatus.FAILED,
                     progress=0.0,
-                    message=f"Quality Gate RED: Camera registration below 20% ({colmap_summary.registration_percentage:.1f}%). Stopped before GSplat.",
+                    message=f"Quality Gate RED: Camera registration below 20% ({colmap_summary.registration_percentage:.1f}%). Stopped before Dense MVS.",
                     quality_score=quality_score,
                     total_cameras=total_cameras,
                     registered_cameras=registered_cameras,
@@ -757,42 +805,121 @@ class PipelineManager:
                 return
 
             # =========================================================
-            # STAGE 5: Training 3D Gaussian Splatting (3DGS)
+            # STAGE 6: Dense Stereo (image_undistorter + patch_match_stereo)
             # =========================================================
             if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 4, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_5_GSPLAT")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 5, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_6_DENSE_STEREO")
                 manifest_written = True
                 return
-            gsplat_res = self._execute_stage_5_gsplat(
+            dense_stereo_ok = self._execute_stage_6_dense_stereo(
+                session_frames_dir=session_frames_dir,
                 sparse_dir=sparse_dir,
-                images_dir=session_frames_dir,
-                session_output_dir=session_output_dir,
+                dense_workspace_dir=dense_workspace_dir,
                 total_cameras=total_cameras,
                 registered_cameras=registered_cameras,
                 sparse_points=sparse_points,
                 quality_score=quality_score,
             )
             if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 4, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_5_GSPLAT")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 5, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_6_DENSE_STEREO")
                 manifest_written = True
                 return
-            if not gsplat_res:
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 4, True, registered_cameras, total_cameras, "Stage 5 failed: 3D Gaussian Splatting optimization failed.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_5_GSPLAT")
+            if not dense_stereo_ok:
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 5, True, registered_cameras, total_cameras, "Stage 6 failed: COLMAP dense stereo reconstruction failed.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_6_DENSE_STEREO")
                 manifest_written = True
                 return
 
-            self.last_gsplat_result = gsplat_res
-            current_stage = 5
-            self._last_stage_name = "STAGE_5_GSPLAT"
+            current_stage = 6
+            self._last_stage_name = "STAGE_6_DENSE_STEREO"
 
             # =========================================================
-            # STAGE 6: Exporting Model (Multi-format PLY, OBJ, GLB, Trajectory)
+            # STAGE 7: Stereo Fusion (dense/fused.ply)
             # =========================================================
             if self._stop_event.is_set():
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 5, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_6_EXPORT")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 6, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_7_STEREO_FUSION")
                 manifest_written = True
                 return
-            export_ok = self._execute_stage_6_export(
+
+            fused_ply_workspace = dense_workspace_dir / "fused.ply"
+            dense_points = self._execute_stage_7_stereo_fusion(
+                dense_workspace_dir=dense_workspace_dir,
+                fused_ply_path=fused_ply_workspace,
+                total_cameras=total_cameras,
+                registered_cameras=registered_cameras,
+                sparse_points=sparse_points,
+                quality_score=quality_score,
+            )
+            if self._stop_event.is_set():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 6, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_7_STEREO_FUSION")
+                manifest_written = True
+                return
+            if dense_points == 0 or not fused_ply_workspace.exists():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 6, True, registered_cameras, total_cameras, "Stage 7 failed: COLMAP stereo fusion failed to generate dense/fused.ply.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_7_STEREO_FUSION")
+                manifest_written = True
+                return
+
+            # Ensure dense/fused.ply exists in session output deliverables
+            output_fused_ply = session_output_dense_dir / "fused.ply"
+            try:
+                shutil.copyfile(fused_ply_workspace, output_fused_ply)
+            except Exception as e:
+                logger.warning(f"Copying fused.ply to output dense folder: {e}")
+
+            # Also provide point_cloud.ply at root as point cloud deliverable
+            output_root_ply = session_output_dir / "point_cloud.ply"
+            try:
+                shutil.copyfile(fused_ply_workspace, output_root_ply)
+            except Exception as e:
+                pass
+
+            current_stage = 7
+            self._last_stage_name = "STAGE_7_STEREO_FUSION"
+
+            # =========================================================
+            # STAGE 8: Screened Poisson Surface Reconstruction (Open3D)
+            # =========================================================
+            if self._stop_event.is_set():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 7, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_8_POISSON_MESHING")
+                manifest_written = True
+                return
+
+            mesh_obj = session_output_dir / "model.obj"
+            mesh_ply = session_output_dir / "model.ply"
+            mesh_glb = session_output_dir / "model.glb"
+
+            poisson_res = self._execute_stage_8_poisson_meshing(
+                fused_ply_path=fused_ply_workspace,
+                output_obj_path=mesh_obj,
+                output_ply_path=mesh_ply,
+                output_glb_path=mesh_glb,
+                total_cameras=total_cameras,
+                registered_cameras=registered_cameras,
+                sparse_points=sparse_points,
+                dense_points=dense_points,
+                quality_score=quality_score,
+            )
+            if self._stop_event.is_set():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 7, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_8_POISSON_MESHING")
+                manifest_written = True
+                return
+            if not poisson_res or not poisson_res.is_success:
+                err_m = poisson_res.error_message if poisson_res else "Unknown"
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 7, True, registered_cameras, total_cameras, f"Stage 8 failed: Screened Poisson Reconstruction failed: {err_m}", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_8_POISSON_MESHING")
+                manifest_written = True
+                return
+
+            self.last_poisson_result = poisson_res
+            current_stage = 8
+            self._last_stage_name = "STAGE_8_POISSON_MESHING"
+
+            # =========================================================
+            # STAGE 9: Export Assets (OBJ, GLB, PLY, Trajectory & Manifests)
+            # =========================================================
+            if self._stop_event.is_set():
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_CANCELLED, 8, True, registered_cameras, total_cameras, "Reconstruction cancelled by user.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_9_EXPORT")
+                manifest_written = True
+                return
+            export_ok = self._execute_stage_9_export(
                 session_name=session_name,
                 session_output_dir=session_output_dir,
                 session_frames_dir=session_frames_dir,
@@ -801,31 +928,32 @@ class PipelineManager:
                 blur_res=blur_res,
                 dup_res=dup_res,
                 colmap_summary=colmap_summary,
-                gsplat_res=gsplat_res,
+                dense_points=dense_points,
+                poisson_res=poisson_res,
                 quality_score=quality_score,
                 total_runtime=time.time() - pipeline_start_t,
             )
 
             if export_ok:
                 manifest_written = True
-                current_stage = 6
-                self._last_stage_name = "STAGE_6_EXPORT"
+                current_stage = 9
+                self._last_stage_name = "STAGE_9_EXPORT"
                 self.write_diagnostics(
                     session_output_dir=session_output_dir,
                     worker_thread_status="completed",
                     failure_reason=None,
-                    last_processed_stage="STAGE_6_EXPORT",
+                    last_processed_stage="STAGE_9_EXPORT",
                     last_registered_camera_count=registered_cameras,
                 )
             else:
-                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 5, True, registered_cameras, total_cameras, "Stage 6 failed: Deliverables packaging failed.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_6_EXPORT")
+                self._save_session_outcome(session_output_dir, session_name, PIPELINE_STATUS_FAILED, 8, True, registered_cameras, total_cameras, "Stage 9 failed: Deliverables packaging failed.", colmap_summary.registration_percentage, sparse_points, stage_name_str="STAGE_9_EXPORT")
                 manifest_written = True
 
             logger.info("=" * 75)
             logger.info("🎉 Studio 3D Reconstruction Session Completed Successfully!")
             logger.info(f"Registered Cameras: {registered_cameras}/{total_cameras} ({colmap_summary.registration_percentage}%)")
-            logger.info(f"Sparse 3D Points: {sparse_points:,} | Final PSNR: {gsplat_res.final_psnr} dB")
-            logger.info(f"Final Gaussians: {gsplat_res.final_gaussian_count:,}")
+            logger.info(f"Sparse 3D Points: {sparse_points:,} | Dense 3D Points: {dense_points:,}")
+            logger.info(f"Screened Poisson Mesh: {poisson_res.triangle_count:,} Triangles | {poisson_res.vertex_count:,} Vertices")
             logger.info(f"Deliverables Ready in: {session_output_dir}")
             logger.info("=" * 75)
 
@@ -873,7 +1001,7 @@ class PipelineManager:
             if not (session_output_dir / "diagnostics.json").exists():
                 self.write_diagnostics(
                     session_output_dir=session_output_dir,
-                    worker_thread_status="completed" if (quality_gate_passed and current_stage == 6) else "failed",
+                    worker_thread_status="completed" if (quality_gate_passed and current_stage == 9) else "failed",
                     last_processed_stage=f"STAGE_{current_stage}",
                     last_registered_camera_count=registered_cameras,
                 )
@@ -886,9 +1014,9 @@ class PipelineManager:
     ) -> Tuple[str, bool, int, str]:
         """
         Authoritative Reconstruction Quality Gate:
-        - Green (>=40%): High confidence, continue automatically to 3DGS.
+        - Green (>=40%): High confidence, continue automatically to Dense Reconstruction.
         - Yellow (20-40%): Moderate confidence, pause for 'Continue Anyway' review.
-        - Red (<20%): Low confidence, halt before GSplat and recommend retry settings.
+        - Red (<20%): Low confidence, halt before Dense Reconstruction and recommend retry settings.
         """
         reg_pct = colmap_summary.registration_percentage
         points = colmap_summary.sparse_point_count
@@ -899,7 +1027,7 @@ class PipelineManager:
         if reg_pct >= 40.0:
             level = "GREEN"
             proceed = True
-            action = "High reconstruction confidence (≥40%). Proceeding automatically to 3D Gaussian Splatting."
+            action = "High reconstruction confidence (≥40%). Proceeding automatically to Dense Reconstruction."
         elif reg_pct >= 20.0 or (total_cams <= 4 and reg_cams >= 1):
             level = "YELLOW"
             proceed = getattr(self, "auto_continue_yellow", False)
@@ -907,7 +1035,7 @@ class PipelineManager:
         else:
             level = "RED"
             proceed = False
-            action = "Low reconstruction confidence (<20%). Reconstruction halted before 3DGS. Adjust settings and retry."
+            action = "Low reconstruction confidence (<20%). Reconstruction halted before Dense Reconstruction. Adjust settings and retry."
 
         # Save recovery suggestions if Red or Yellow
         if level in ("RED", "YELLOW"):
@@ -954,15 +1082,14 @@ class PipelineManager:
         self,
         video_path: Path,
         session_frames_dir: Path,
-        session_output_dir: Path,
-        session_name: str,
-    ) -> Tuple[Optional[List[Path]], Optional[VideoMetadata], Optional[BlurFilterResult], Optional[DuplicateFilterResult]]:
-        """Stage 1: Extracts frames, filters blur, removes duplicates, and generates preprocess report."""
+    ) -> Tuple[Optional[List[Path]], Optional[VideoMetadata]]:
+        """Stage 1: Ingests video and extracts keyframes."""
+        logger.info("[Stage 1/9] Ingesting video stream and extracting keyframes...")
         self.emit_event(
             StageType.FRAME_EXTRACTION,
             StageStatus.RUNNING,
-            0.1,
-            "Ingesting video stream and extracting adaptive keyframes...",
+            0.05,
+            "Ingesting video stream and extracting keyframes...",
             global_progress=0.01,
         )
 
@@ -972,48 +1099,98 @@ class PipelineManager:
                 video_path=video_path,
                 output_frames_dir=session_frames_dir,
                 on_progress=lambda p, msg, m: self.emit_event(
-                    StageType.FRAME_EXTRACTION, StageStatus.RUNNING, p * 0.4, msg, m, global_progress=0.01 + p * 0.04
+                    StageType.FRAME_EXTRACTION, StageStatus.RUNNING, p, msg, m, global_progress=0.01 + p * 0.04
                 ),
                 stop_event=self._stop_event,
             )
             if self._stop_event.is_set():
-                return None, None, None, None
+                return None, None
 
+            if not extracted_paths:
+                self.emit_event(StageType.FRAME_EXTRACTION, StageStatus.FAILED, 0.0, "No frames could be extracted.")
+                return None, None
+
+            self.emit_event(
+                StageType.FRAME_EXTRACTION,
+                StageStatus.COMPLETED,
+                1.0,
+                f"Extracted {len(extracted_paths)} raw frames from video stream.",
+                metrics={
+                    "Extracted": len(extracted_paths),
+                    "FPS": f"{meta.fps:.1f}",
+                    "Resolution": meta.resolution_str,
+                    "Duration": meta.duration_formatted,
+                },
+                global_progress=0.05,
+            )
+            return extracted_paths, meta
+
+        except Exception as e:
+            logger.exception(f"Error in Stage 1 Frame Extraction: {e}")
+            self.emit_event(StageType.FRAME_EXTRACTION, StageStatus.FAILED, 0.0, str(e))
+            return None, None
+
+    def _execute_stage_2_filter_frames(
+        self,
+        extracted_paths: List[Path],
+        session_output_dir: Path,
+        session_name: str,
+        meta: Optional[VideoMetadata],
+    ) -> Tuple[Optional[List[Path]], Optional[BlurFilterResult], Optional[DuplicateFilterResult]]:
+        """Stage 2: Filters blurry frames and removes visual duplicates."""
+        logger.info("[Stage 2/9] Filtering frames (blur & duplicate elimination)...")
+        self.emit_event(
+            StageType.FILTER_FRAMES,
+            StageStatus.RUNNING,
+            0.05,
+            "Filtering blurry frames using Laplacian variance...",
+            global_progress=0.05,
+        )
+
+        try:
             blur_res = self.blur_filter.filter_frames(
                 frame_paths=extracted_paths,
                 delete_discarded=True,
                 on_progress=lambda p, msg, m: self.emit_event(
-                    StageType.FRAME_EXTRACTION, StageStatus.RUNNING, 0.4 + p * 0.3, msg, m, global_progress=0.05 + p * 0.025
+                    StageType.FILTER_FRAMES, StageStatus.RUNNING, p * 0.5, msg, m, global_progress=0.05 + p * 0.035
                 ),
                 stop_event=self._stop_event,
             )
             if self._stop_event.is_set():
-                return None, None, None, None
+                return None, None, None
+
+            self.emit_event(
+                StageType.FILTER_FRAMES,
+                StageStatus.RUNNING,
+                0.5,
+                "Analyzing perceptual similarity and removing duplicates...",
+                global_progress=0.085,
+            )
 
             dup_res = self.duplicate_filter.filter_duplicates(
                 frame_paths=blur_res.retained_frames,
                 delete_discarded=True,
                 on_progress=lambda p, msg, m: self.emit_event(
-                    StageType.FRAME_EXTRACTION, StageStatus.RUNNING, 0.7 + p * 0.3, msg, m, global_progress=0.075 + p * 0.025
+                    StageType.FILTER_FRAMES, StageStatus.RUNNING, 0.5 + p * 0.5, msg, m, global_progress=0.085 + p * 0.035
                 ),
                 stop_event=self._stop_event,
             )
             if self._stop_event.is_set():
-                return None, None, None, None
+                return None, None, None
 
             final_dataset = dup_res.retained_frames
 
-            # Preprocess JSON Report
+            # Write Preprocess JSON Report
             report_file = session_output_dir / "preprocess_report.json"
             report_data = {
                 "session_name": session_name,
                 "timestamp": datetime.now().isoformat(),
                 "video_metadata": {
-                    "filename": meta.filename,
-                    "resolution": meta.resolution_str,
-                    "fps": meta.fps,
-                    "duration_formatted": meta.duration_formatted,
-                    "original_total_frames": meta.total_frames,
+                    "filename": meta.filename if meta else "unknown",
+                    "resolution": meta.resolution_str if meta else "unknown",
+                    "fps": meta.fps if meta else 0.0,
+                    "duration_formatted": meta.duration_formatted if meta else "unknown",
+                    "original_total_frames": meta.total_frames if meta else len(extracted_paths),
                 },
                 "preprocessing_metrics": {
                     "extracted_frames": len(extracted_paths),
@@ -1027,35 +1204,35 @@ class PipelineManager:
                 json.dump(report_data, f, indent=2)
 
             self.emit_event(
-                StageType.FRAME_EXTRACTION,
+                StageType.FILTER_FRAMES,
                 StageStatus.COMPLETED,
                 1.0,
                 f"Prepared clean dataset of {len(final_dataset)} frames.",
                 metrics={
-                    "Extracted": len(extracted_paths),
-                    "Blurry Removed": blur_res.discarded_count,
-                    "Duplicates Removed": dup_res.discarded_count,
-                    "Final Frames": len(final_dataset),
+                    "Retained": len(final_dataset),
+                    "Blur Removed": blur_res.discarded_count,
+                    "Dup Removed": dup_res.discarded_count,
+                    "Avg Blur": f"{blur_res.average_score:.1f}",
                 },
-                global_progress=0.10,
+                global_progress=0.12,
                 total_cameras=len(final_dataset),
             )
-            return final_dataset, meta, blur_res, dup_res
+            return final_dataset, blur_res, dup_res
 
         except Exception as e:
-            logger.exception(f"Error in Stage 1 Frame Extraction: {e}")
-            self.emit_event(StageType.FRAME_EXTRACTION, StageStatus.FAILED, 0.0, str(e))
-            return None, None, None, None
+            logger.exception(f"Error in Stage 2 Frame Filtering: {e}")
+            self.emit_event(StageType.FILTER_FRAMES, StageStatus.FAILED, 0.0, str(e))
+            return None, None, None
 
-    def _execute_stage_2_features(self, images_dir: Path, database_path: Path) -> bool:
-        """Stage 2: Runs real COLMAP feature extractor (SIFT)."""
-        logger.info("[Stage 2/6] Running COLMAP Feature Extractor...")
+    def _execute_stage_3_features(self, images_dir: Path, database_path: Path) -> bool:
+        """Stage 3: Runs COLMAP SIFT feature extraction with GPU acceleration."""
+        logger.info("[Stage 3/9] Running COLMAP Feature Extractor...")
         self.emit_event(
             StageType.COLMAP_FEATURES,
             StageStatus.RUNNING,
             0.1,
             "Extracting SIFT keypoints with GPU acceleration...",
-            global_progress=0.10,
+            global_progress=0.12,
         )
 
         ok = self.colmap_runner.run_feature_extraction(
@@ -1088,14 +1265,14 @@ class PipelineManager:
             )
         return ok
 
-    def _execute_stage_3_matching(self, database_path: Path) -> bool:
-        """Stage 3: Runs real COLMAP feature matcher."""
-        logger.info("[Stage 3/6] Running COLMAP Feature Matcher...")
+    def _execute_stage_4_matching(self, database_path: Path) -> bool:
+        """Stage 4: Runs COLMAP feature matcher across image pairs."""
+        logger.info("[Stage 4/9] Running COLMAP Feature Matcher...")
         self.emit_event(
             StageType.COLMAP_MATCHING,
             StageStatus.RUNNING,
             0.1,
-            "Exhaustive feature matching across image pairs...",
+            f"{self.config.colmap.matcher_type.capitalize()} feature matching across image pairs...",
             global_progress=0.25,
         )
 
@@ -1104,7 +1281,7 @@ class PipelineManager:
             matcher_type=self.config.colmap.matcher_type,
             use_gpu=True,
             on_log=lambda l: self.emit_event(
-                StageType.COLMAP_MATCHING, StageStatus.RUNNING, 0.5, f"COLMAP Matcher: {l[:50]}", global_progress=0.33
+                StageType.COLMAP_MATCHING, StageStatus.RUNNING, 0.5, f"COLMAP Matcher: {l[:50]}", global_progress=0.32
             ),
             stop_event=self._stop_event,
         )
@@ -1116,7 +1293,7 @@ class PipelineManager:
                 1.0,
                 "Feature matching completed and two-view geometry verified.",
                 metrics={"Matcher": self.config.colmap.matcher_type.capitalize(), "Status": "Matched"},
-                global_progress=0.40,
+                global_progress=0.38,
             )
         else:
             self.emit_event(
@@ -1127,7 +1304,7 @@ class PipelineManager:
             )
         return ok
 
-    def _execute_stage_4_mapper(
+    def _execute_stage_5_mapper(
         self,
         images_dir: Path,
         database_path: Path,
@@ -1136,14 +1313,14 @@ class PipelineManager:
         session_name: str,
         session_output_dir: Path,
     ) -> Optional[ColmapSummary]:
-        """Stage 4: Runs real COLMAP mapper with live registration & point telemetry, converts best model to TXT, and generates colmap_summary.json."""
-        logger.info("[Stage 4/6] Running COLMAP Incremental Mapper (Sparse Reconstruction)...")
+        """Stage 5: Runs COLMAP incremental mapper with live registration & point telemetry."""
+        logger.info("[Stage 5/9] Running COLMAP Incremental Mapper (Sparse Reconstruction)...")
         self.emit_event(
             StageType.COLMAP_MAPPER,
             StageStatus.RUNNING,
             0.05,
             "Running Incremental Mapper & Bundle Adjustment...",
-            global_progress=0.40,
+            global_progress=0.38,
             total_cameras=total_cameras,
         )
 
@@ -1159,7 +1336,7 @@ class PipelineManager:
             reg_pct = (_live_reg_cams / total_cameras) * 100 if total_cameras > 0 else 100.0
             score = calculate_live_quality_score(_live_reg_cams, total_cameras, _live_sparse_pts)
             cam_frac = min(1.0, _live_reg_cams / max(1, total_cameras))
-            g_prog = 0.40 + (0.25 * cam_frac)
+            g_prog = 0.38 + (0.17 * cam_frac)
             self.emit_event(
                 StageType.COLMAP_MAPPER,
                 StageStatus.RUNNING,
@@ -1179,7 +1356,7 @@ class PipelineManager:
             _live_sparse_pts = max(_live_sparse_pts, pts)
             score = calculate_live_quality_score(_live_reg_cams, total_cameras, _live_sparse_pts)
             cam_frac = min(1.0, _live_reg_cams / max(1, total_cameras))
-            g_prog = 0.40 + (0.25 * cam_frac)
+            g_prog = 0.38 + (0.17 * cam_frac)
             self.emit_event(
                 StageType.COLMAP_MAPPER,
                 StageStatus.RUNNING,
@@ -1196,7 +1373,7 @@ class PipelineManager:
 
         def _on_ba_event(line: str):
             cam_frac = min(1.0, _live_reg_cams / max(1, total_cameras))
-            g_prog = 0.40 + (0.25 * cam_frac)
+            g_prog = 0.38 + (0.17 * cam_frac)
             score = calculate_live_quality_score(_live_reg_cams, total_cameras, _live_sparse_pts)
             self.emit_event(
                 StageType.COLMAP_MAPPER,
@@ -1221,7 +1398,7 @@ class PipelineManager:
             if now - last_log_emit_t >= 0.4 or "Registered image" in line:
                 last_log_emit_t = now
                 cam_frac = min(1.0, _live_reg_cams / max(1, total_cameras))
-                g_prog = 0.40 + (0.25 * cam_frac)
+                g_prog = 0.38 + (0.17 * cam_frac)
                 score = calculate_live_quality_score(_live_reg_cams, total_cameras, _live_sparse_pts)
                 self.emit_event(
                     StageType.COLMAP_MAPPER,
@@ -1248,7 +1425,6 @@ class PipelineManager:
         )
 
         if not ok:
-            # Check if any partial reconstruction exists in sparse_dir to preserve
             try:
                 partial_dir, part_imgs, part_pts = self.colmap_runner.find_best_model_dir(sparse_dir)
                 if part_imgs > 0:
@@ -1259,7 +1435,6 @@ class PipelineManager:
             self.emit_event(StageType.COLMAP_MAPPER, StageStatus.FAILED, 0.0, "COLMAP mapper failed.")
             return None
 
-        # Detect best model folder across all reconstructed components (e.g. 0, 1, 2)
         best_model_dir, best_imgs, best_pts = self.colmap_runner.find_best_model_dir(sparse_dir)
         logger.info(f"Using best reconstructed model at: {best_model_dir} ({best_imgs} cameras, {best_pts} points)")
 
@@ -1271,7 +1446,6 @@ class PipelineManager:
             stop_event=self._stop_event,
         )
 
-        # If best_model_dir is not 0, sync 0 as the canonical reference
         model_0_dir = sparse_dir / "0"
         if best_model_dir != model_0_dir and best_model_dir.exists():
             for f_name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "images.txt", "points3D.txt"]:
@@ -1283,7 +1457,6 @@ class PipelineManager:
                     except Exception:
                         pass
 
-        # Parse metrics from best model
         mapper_runtime = time.time() - mapper_start_t
         gpu_name = "NVIDIA CUDA GPU" if self.colmap_runner.is_gpu_available() else "CPU Fallback"
         summary = self.colmap_runner.parse_reconstruction_results(
@@ -1294,7 +1467,6 @@ class PipelineManager:
             device_used=gpu_name,
         )
 
-        # Generate outputs/session_name/colmap_summary.json
         summary_file = session_output_dir / "colmap_summary.json"
         summary_data = {
             "session_name": session_name,
@@ -1329,58 +1501,88 @@ class PipelineManager:
                 "3D Points": f"{summary.sparse_point_count:,}",
                 "Mean Reproj Error": f"{summary.mean_reprojection_error} px",
             },
-            global_progress=0.65,
+            global_progress=0.55,
             total_cameras=summary.total_cameras,
             registered_cameras=summary.registered_cameras,
             sparse_points=summary.sparse_point_count,
         )
         return summary
 
-    def _execute_stage_5_gsplat(
+    def _execute_stage_6_dense_stereo(
         self,
+        session_frames_dir: Path,
         sparse_dir: Path,
-        images_dir: Path,
-        session_output_dir: Path,
+        dense_workspace_dir: Path,
         total_cameras: int,
         registered_cameras: int,
         sparse_points: int,
         quality_score: int,
-    ) -> Optional[GSplatTrainingResult]:
-        """Stage 5: Runs real 3D Gaussian Splatting optimization with live telemetry."""
-        logger.info("[Stage 5/6] Initializing 3D Gaussian Splatting (3DGS) Optimization...")
+    ) -> bool:
+        """Stage 6: Runs COLMAP image_undistorter and patch_match_stereo (MVS depth & normal maps)."""
+        logger.info("[Stage 6/9] Running Dense Stereo (image_undistorter + patch_match_stereo)...")
         self.emit_event(
-            StageType.GAUSSIAN_SPLATTING,
+            StageType.DENSE_STEREO,
             StageStatus.RUNNING,
             0.05,
-            "Initializing 3D Gaussians from COLMAP sparse point cloud...",
-            global_progress=0.65,
+            "Undistorting camera images for Multi-View Stereo...",
+            metrics={"Sub-State": "Undistorting Images", "Device": "CUDA"},
+            global_progress=0.55,
             total_cameras=total_cameras,
             registered_cameras=registered_cameras,
             sparse_points=sparse_points,
             quality_score=quality_score,
         )
 
-        def on_gsplat_telemetry(telem: Dict[str, Any]):
-            prog = telem["progress"]
-            g_prog = 0.65 + (prog * 0.30)  # 0.65 to 0.95
-            iter_speed = float(telem.get("iter_speed", 10.0))
-            eta_s = self._eta_tracker.estimate_eta_gsplat(telem["iteration"], telem["total_iterations"], iter_speed)
-            msg = (
-                f"Iter: {telem['iteration']:,}/{telem['total_iterations']:,} | "
-                f"Loss: {telem['loss']:.4f} | PSNR: {telem['psnr']:.1f} dB | "
-                f"Gaussians: {telem['gaussian_count']:,}"
-            )
+        dense_workspace_dir.mkdir(parents=True, exist_ok=True)
+        best_model_dir, _, _ = self.colmap_runner.find_best_model_dir(sparse_dir)
+        sparse_input = best_model_dir if best_model_dir.exists() else (sparse_dir / "0")
+
+        # Step 1: Image Undistortion
+        undistort_ok = self.colmap_runner.run_image_undistorter(
+            image_path=session_frames_dir,
+            input_model_dir=sparse_input,
+            output_dense_dir=dense_workspace_dir,
+            max_image_size=self.config.dense.max_image_size,
+            on_log=lambda l: self.emit_event(
+                StageType.DENSE_STEREO, StageStatus.RUNNING, 0.15, f"Undistorter: {l[:50]}", global_progress=0.57
+            ),
+            stop_event=self._stop_event,
+        )
+
+        if not undistort_ok:
+            self.emit_event(StageType.DENSE_STEREO, StageStatus.FAILED, 0.0, "COLMAP image_undistorter failed.")
+            return False
+
+        if self._stop_event.is_set():
+            return False
+
+        # Step 2: Patch Match Stereo (Depth & Normal Maps)
+        self.emit_event(
+            StageType.DENSE_STEREO,
+            StageStatus.RUNNING,
+            0.25,
+            "Computing photometric & geometric MVS depth maps (CUDA accelerated)...",
+            metrics={"Sub-State": "Patch Match Stereo", "Device": "NVIDIA GPU"},
+            global_progress=0.58,
+            total_cameras=total_cameras,
+            registered_cameras=registered_cameras,
+            sparse_points=sparse_points,
+            quality_score=quality_score,
+        )
+
+        def _on_patch_match_progress(view_idx: int, num_views: int):
+            frac = min(1.0, view_idx / max(1, num_views))
+            g_prog = 0.58 + (0.12 * frac)
+            eta_s = self._eta_tracker.estimate_eta_dense(view_idx, num_views)
             self.emit_event(
-                StageType.GAUSSIAN_SPLATTING,
+                StageType.DENSE_STEREO,
                 StageStatus.RUNNING,
-                prog,
-                msg,
+                0.25 + (frac * 0.75),
+                f"Stereo Depth Estimation: view {view_idx}/{num_views} ({frac*100:.1f}%)",
                 metrics={
-                    "Iteration": f"{telem['iteration']:,}",
-                    "Loss": f"{telem['loss']:.4f}",
-                    "PSNR": f"{telem['psnr']:.1f} dB",
-                    "Gaussians": f"{telem['gaussian_count']:,}",
-                    "Speed": f"{telem['iter_speed']} it/s",
+                    "Stereo View": f"{view_idx}/{num_views}",
+                    "Dense Mode": "CUDA GPU",
+                    "Sub-State": "PatchMatch Stereo",
                 },
                 global_progress=g_prog,
                 eta_seconds=eta_s,
@@ -1390,28 +1592,187 @@ class PipelineManager:
                 quality_score=quality_score,
             )
 
-        res = self.gsplat_runner.train_gaussian_splatting(
-            sparse_dir=sparse_dir,
-            images_dir=images_dir,
-            output_dir=session_output_dir,
-            total_iterations=self.config.gsplat.iterations,
-            on_telemetry=on_gsplat_telemetry,
+        stereo_ok = self.colmap_runner.run_patch_match_stereo(
+            workspace_path=dense_workspace_dir,
+            max_image_size=self.config.dense.max_image_size,
+            gpu_index=self.config.dense.gpu_index,
+            on_log=lambda l: None,
+            on_view_progress=_on_patch_match_progress,
             stop_event=self._stop_event,
         )
 
-        if res.is_converged:
+        if stereo_ok:
             self.emit_event(
-                StageType.GAUSSIAN_SPLATTING,
+                StageType.DENSE_STEREO,
                 StageStatus.COMPLETED,
                 1.0,
-                f"3DGS Converged: Final PSNR {res.final_psnr} dB ({res.final_gaussian_count:,} Gaussians).",
+                "Dense stereo depth maps and normals generated successfully.",
+                metrics={"Stereo": "Complete", "Workspace": dense_workspace_dir.name},
+                global_progress=0.70,
+                total_cameras=total_cameras,
+                registered_cameras=registered_cameras,
+                sparse_points=sparse_points,
+                quality_score=quality_score,
+            )
+            return True
+        else:
+            self.emit_event(
+                StageType.DENSE_STEREO,
+                StageStatus.FAILED,
+                0.0,
+                "COLMAP patch_match_stereo failed.",
+            )
+            return False
+
+    def _execute_stage_7_stereo_fusion(
+        self,
+        dense_workspace_dir: Path,
+        fused_ply_path: Path,
+        total_cameras: int,
+        registered_cameras: int,
+        sparse_points: int,
+        quality_score: int,
+    ) -> int:
+        """Stage 7: Fuses depth and normal maps into a high-density point cloud (fused.ply)."""
+        logger.info("[Stage 7/9] Running COLMAP Stereo Fusion...")
+        self.emit_event(
+            StageType.STEREO_FUSION,
+            StageStatus.RUNNING,
+            0.1,
+            "Fusing depth & normal maps into dense point cloud...",
+            metrics={"Sub-State": "Stereo Fusion"},
+            global_progress=0.70,
+            total_cameras=total_cameras,
+            registered_cameras=registered_cameras,
+            sparse_points=sparse_points,
+            quality_score=quality_score,
+        )
+
+        _fused_pts = 0
+
+        def _on_view_progress(view_idx: int, num_views: int):
+            frac = min(1.0, view_idx / max(1, num_views)) if num_views > 0 else 0.5
+            g_prog = 0.70 + (0.12 * frac)
+            self.emit_event(
+                StageType.STEREO_FUSION,
+                StageStatus.RUNNING,
+                frac,
+                f"Fusing depth maps: view {view_idx}/{num_views} | {_fused_pts:,} dense points",
+                metrics={"Views Fused": f"{view_idx}/{num_views}", "Dense Points": f"{_fused_pts:,}"},
+                global_progress=g_prog,
+                total_cameras=total_cameras,
+                registered_cameras=registered_cameras,
+                sparse_points=sparse_points,
+                quality_score=quality_score,
+            )
+
+        def _on_fused_points(pts: int):
+            nonlocal _fused_pts
+            _fused_pts = max(_fused_pts, pts)
+
+        fusion_ok = self.colmap_runner.run_stereo_fusion(
+            workspace_path=dense_workspace_dir,
+            output_ply_path=fused_ply_path,
+            min_num_pixels=self.config.dense.min_num_pixels,
+            on_log=lambda l: None,
+            on_view_progress=_on_view_progress,
+            on_fused_points=_on_fused_points,
+            stop_event=self._stop_event,
+        )
+
+        dense_pts = 0
+        if fused_ply_path.exists():
+            dense_pts = PoissonMesher.get_point_cloud_info(fused_ply_path).get("point_count", _fused_pts)
+            if dense_pts == 0 and _fused_pts > 0:
+                dense_pts = _fused_pts
+
+        if fusion_ok and fused_ply_path.exists() and dense_pts > 0:
+            self.last_dense_ply = fused_ply_path
+            self.emit_event(
+                StageType.STEREO_FUSION,
+                StageStatus.COMPLETED,
+                1.0,
+                f"Dense Point Cloud Generated: {dense_pts:,} points.",
+                metrics={"Dense Points": f"{dense_pts:,}", "Output": "fused.ply"},
+                global_progress=0.82,
+                total_cameras=total_cameras,
+                registered_cameras=registered_cameras,
+                sparse_points=sparse_points,
+                quality_score=quality_score,
+            )
+            return dense_pts
+        else:
+            self.emit_event(
+                StageType.STEREO_FUSION,
+                StageStatus.FAILED,
+                0.0,
+                "COLMAP stereo_fusion failed to produce fused point cloud.",
+            )
+            return 0
+
+    def _execute_stage_8_poisson_meshing(
+        self,
+        fused_ply_path: Path,
+        output_obj_path: Path,
+        output_ply_path: Path,
+        output_glb_path: Path,
+        total_cameras: int,
+        registered_cameras: int,
+        sparse_points: int,
+        dense_points: int,
+        quality_score: int,
+    ) -> Optional[PoissonResult]:
+        """Stage 8: Reconstructs watertight mesh via Open3D Screened Poisson Surface Reconstruction."""
+        logger.info("[Stage 8/9] Running Screened Poisson Surface Reconstruction...")
+        self.emit_event(
+            StageType.POISSON_MESHING,
+            StageStatus.RUNNING,
+            0.05,
+            "Reconstructing watertight Screened Poisson surface mesh...",
+            metrics={"Sub-State": "Poisson Reconstruction", "Dense Points": f"{dense_points:,}"},
+            global_progress=0.82,
+            total_cameras=total_cameras,
+            registered_cameras=registered_cameras,
+            sparse_points=sparse_points,
+            quality_score=quality_score,
+        )
+
+        def _on_poisson_progress(frac: float, msg: str):
+            g_prog = 0.82 + (0.12 * frac)
+            self.emit_event(
+                StageType.POISSON_MESHING,
+                StageStatus.RUNNING,
+                frac,
+                f"Poisson Mesher: {msg}",
+                metrics={"Sub-State": msg[:30], "Dense Points": f"{dense_points:,}"},
+                global_progress=g_prog,
+                total_cameras=total_cameras,
+                registered_cameras=registered_cameras,
+                sparse_points=sparse_points,
+                quality_score=quality_score,
+            )
+
+        res = self.poisson_mesher.reconstruct_mesh(
+            input_ply_path=fused_ply_path,
+            output_obj_path=output_obj_path,
+            output_ply_path=output_ply_path,
+            output_glb_path=output_glb_path,
+            on_progress=_on_poisson_progress,
+            stop_event=self._stop_event,
+        )
+
+        if res.is_success:
+            self.emit_event(
+                StageType.POISSON_MESHING,
+                StageStatus.COMPLETED,
+                1.0,
+                f"Poisson Mesh Complete: {res.triangle_count:,} triangles, {res.vertex_count:,} vertices.",
                 metrics={
-                    "Final PSNR": f"{res.final_psnr} dB",
-                    "Final Loss": f"{res.final_loss}",
-                    "Gaussians": f"{res.final_gaussian_count:,}",
-                    "Runtime": f"{res.training_time_seconds}s",
+                    "Triangles": f"{res.triangle_count:,}",
+                    "Vertices": f"{res.vertex_count:,}",
+                    "Runtime": f"{res.runtime_seconds:.1f}s",
                 },
-                global_progress=0.95,
+                global_progress=0.94,
                 total_cameras=total_cameras,
                 registered_cameras=registered_cameras,
                 sparse_points=sparse_points,
@@ -1420,38 +1781,41 @@ class PipelineManager:
             return res
         else:
             self.emit_event(
-                StageType.GAUSSIAN_SPLATTING,
+                StageType.POISSON_MESHING,
                 StageStatus.FAILED,
                 0.0,
-                f"3DGS Training failed: {res.error_message or 'Unknown error'}",
+                f"Screened Poisson Meshing failed: {res.error_message}",
             )
             return None
 
-    def _execute_stage_6_export(
+    def _execute_stage_9_export(
         self,
         session_name: str,
         session_output_dir: Path,
         session_frames_dir: Path,
         sparse_dir: Path,
-        video_meta: VideoMetadata,
-        blur_res: BlurFilterResult,
-        dup_res: DuplicateFilterResult,
+        video_meta: Optional[VideoMetadata],
+        blur_res: Optional[BlurFilterResult],
+        dup_res: Optional[DuplicateFilterResult],
         colmap_summary: ColmapSummary,
-        gsplat_res: GSplatTrainingResult,
+        dense_points: int,
+        poisson_res: PoissonResult,
         quality_score: int,
         total_runtime: float,
     ) -> bool:
-        """Stage 6: Multi-format deliverables packaging (PLY, OBJ, GLB, Trajectory, Manifest)."""
-        logger.info("[Stage 6/6] Packaging final 3D deliverables and scene assets...")
+        """Stage 9: Multi-format deliverables packaging (OBJ, GLB, PLY, Trajectory, Manifest)."""
+        logger.info("[Stage 9/9] Packaging final 3D deliverables and scene assets...")
         self.emit_event(
             StageType.EXPORT,
             StageStatus.RUNNING,
             0.2,
-            "Generating OBJ, GLB, camera trajectory spline, and scene manifest...",
-            global_progress=0.95,
+            "Generating camera trajectory preview, scene manifest, and packaging deliverables...",
+            global_progress=0.94,
         )
 
-        ply_file = session_output_dir / "point_cloud.ply"
+        ply_file = session_output_dir / "dense" / "fused.ply"
+        if not ply_file.exists():
+            ply_file = session_output_dir / "point_cloud.ply"
 
         # 1. Multi-format packaging via ModelExporter (PLY, OBJ, GLB, Trajectory, 16:9 Thumbnail)
         artifacts = self.exporter.package_deliverables(
@@ -1461,15 +1825,15 @@ class PipelineManager:
             ply_file=ply_file,
         )
 
-        # 2. Render Real Cinematic Trajectory Preview Video (1920x1080 30FPS MP4)
+        # 2. Render Trajectory Preview Video (1920x1080 30FPS MP4)
         traj_video_name = "trajectory_preview.mp4"
         traj_res = {}
         try:
             from pipeline.trajectory_renderer import TrajectoryRenderer
 
             def on_traj_render_progress(cur_f: int, tot_f: int, eta_s: float, pct: float):
-                g_prog = 0.95 + (pct / 100.0) * 0.045  # 0.95 to 0.995
-                msg = f"Rendering trajectory... Frame {cur_f:03d}/{tot_f} ({pct:.1f}%) | ETA: {eta_s:.1f}s"
+                g_prog = 0.94 + (pct / 100.0) * 0.05
+                msg = f"Rendering trajectory flythrough... Frame {cur_f:03d}/{tot_f} ({pct:.1f}%) | ETA: {eta_s:.1f}s"
                 self.emit_event(
                     StageType.EXPORT,
                     StageStatus.RUNNING,
@@ -1488,10 +1852,12 @@ class PipelineManager:
             traj_json_path = session_output_dir / "camera_trajectory.json"
             output_mp4_path = session_output_dir / traj_video_name
 
-            if traj_json_path.exists() and ply_file.exists():
+            # Render trajectory against point cloud or mesh
+            render_model_path = ply_file if ply_file.exists() else (session_output_dir / "model.ply")
+            if traj_json_path.exists() and render_model_path.exists():
                 logger.info(f"Rendering cinematic trajectory fly-through MP4 for {session_name}...")
                 traj_res = traj_renderer.render_trajectory_video(
-                    model_path=ply_file,
+                    model_path=render_model_path,
                     trajectory_json_path=traj_json_path,
                     output_video_path=output_mp4_path,
                     on_progress=on_traj_render_progress,
@@ -1499,44 +1865,41 @@ class PipelineManager:
         except Exception as e_traj:
             logger.warning(f"Trajectory preview video rendering note: {e_traj}")
 
-        # 3. Checkpoint and model file size
-        ply_size_mb = round(ply_file.stat().st_size / (1024 * 1024), 2) if ply_file.exists() else 0.0
-
-        # 4. Comprehensive Unified Scene Manifest (Single Source of Truth)
+        # 3. Comprehensive Unified Scene Manifest (Single Source of Truth)
         manifest_file = session_output_dir / "scene_manifest.json"
         manifest_data = {
             "scene_name": session_name,
             "created_at": datetime.now().isoformat(),
             "total_runtime_seconds": round(total_runtime, 2),
             "pipeline_status": PIPELINE_STATUS_COMPLETED,
-            "pipeline_stage_completed": 6,
+            "pipeline_stage_completed": 9,
             "quality_gate_passed": True,
             "registered_cameras": colmap_summary.registered_cameras,
             "total_cameras": colmap_summary.total_cameras,
             "registration_percentage": colmap_summary.registration_percentage,
             "sparse_points": colmap_summary.sparse_point_count,
-            "gaussians": gsplat_res.final_gaussian_count,
-            "psnr": gsplat_res.final_psnr,
-            "training_seconds": gsplat_res.training_time_seconds,
+            "dense_points": dense_points,
+            "triangles": poisson_res.triangle_count,
+            "vertices": poisson_res.vertex_count,
             "reprojection_error": colmap_summary.mean_reprojection_error,
-            "gpu_used": getattr(gsplat_res, "device_used", "NVIDIA CUDA GPU"),
-            "viewer_model": "point_cloud.splat" if (session_output_dir / "point_cloud.splat").exists() else "point_cloud.ply",
+            "gpu_used": colmap_summary.device,
+            "viewer_model": "model.obj" if (session_output_dir / "model.obj").exists() else ("model.glb" if (session_output_dir / "model.glb").exists() else "model.ply"),
             "trajectory_video": traj_video_name,
             "trajectory_duration_seconds": traj_res.get("trajectory_duration_seconds", 10.0),
             "trajectory_fps": traj_res.get("trajectory_fps", 30),
             "trajectory_frames": traj_res.get("trajectory_frames", 300),
             "video": {
-                "name": video_meta.filename,
-                "resolution": video_meta.resolution_str,
-                "fps": video_meta.fps,
-                "duration": video_meta.duration_formatted,
+                "name": video_meta.filename if video_meta else "unknown",
+                "resolution": video_meta.resolution_str if video_meta else "unknown",
+                "fps": video_meta.fps if video_meta else 0.0,
+                "duration": video_meta.duration_formatted if video_meta else "unknown",
             },
             "preprocessing": {
-                "extracted_frames": blur_res.total_evaluated,
-                "blur_removed": blur_res.discarded_count,
-                "duplicates_removed": dup_res.discarded_count,
-                "clean_frames": dup_res.retained_count,
-                "avg_blur_score": blur_res.average_score,
+                "extracted_frames": blur_res.total_evaluated if blur_res else 0,
+                "blur_removed": blur_res.discarded_count if blur_res else 0,
+                "duplicates_removed": dup_res.discarded_count if dup_res else 0,
+                "clean_frames": dup_res.retained_count if dup_res else 0,
+                "avg_blur_score": blur_res.average_score if blur_res else 0.0,
             },
             "colmap_sfm": {
                 "registered_cameras": colmap_summary.registered_cameras,
@@ -1547,56 +1910,68 @@ class PipelineManager:
                 "device": colmap_summary.device,
                 "sfm_runtime_seconds": colmap_summary.runtime_seconds,
             },
-            "gaussian_splatting": {
-                "iterations": gsplat_res.total_iterations,
-                "final_psnr": gsplat_res.final_psnr,
-                "final_loss": gsplat_res.final_loss,
-                "clean_gaussians": gsplat_res.final_gaussian_count,
-                "training_time_seconds": gsplat_res.training_time_seconds,
-                "quality_health_score": quality_score,
-                "device": getattr(gsplat_res, "device_used", "NVIDIA CUDA GPU"),
-                "ply_size_mb": ply_size_mb,
+            "dense_reconstruction": {
+                "dense_points": dense_points,
+                "fused_ply": "dense/fused.ply",
+                "device": "NVIDIA CUDA GPU" if self.colmap_runner.is_gpu_available() else "CPU",
+            },
+            "poisson_mesh": {
+                "model_obj": "model.obj",
+                "model_glb": "model.glb",
+                "model_ply": "model.ply",
+                "triangles": poisson_res.triangle_count,
+                "vertices": poisson_res.vertex_count,
+                "depth": self.config.poisson.depth,
+                "runtime_seconds": poisson_res.runtime_seconds,
             },
             "deliverables": {
+                "model_obj": "model.obj",
+                "model_glb": "model.glb",
+                "model_ply": "model.ply",
+                "dense_fused_ply": "dense/fused.ply",
                 "point_cloud_ply": "point_cloud.ply",
-                "point_cloud_splat": artifacts.get("point_cloud_splat", "point_cloud.splat"),
-                "model_obj": artifacts.get("model_obj", "model.obj"),
-                "model_glb": artifacts.get("model_glb", "model.glb"),
-                "camera_trajectory": artifacts.get("camera_trajectory", "camera_trajectory.json"),
+                "camera_trajectory": "camera_trajectory.json",
                 "trajectory_video": traj_video_name,
                 "colmap_summary": "colmap_summary.json",
                 "preprocess_report": "preprocess_report.json",
                 "thumbnail": "thumbnail.png",
-                "gaussians_model_npz": "checkpoints/gaussians_model.npz",
             },
             "status": "COMPLETED",
         }
         with open(manifest_file, "w", encoding="utf-8") as f:
             json.dump(manifest_data, f, indent=2)
 
-        # 5. Automatic Validation (Verify all deliverables exist and are non-empty)
+        # 4. Automatic Validation (Verify mesh and dense deliverables exist and are non-empty)
         req_files = [
-            ply_file,
             session_output_dir / "model.obj",
-            session_output_dir / "model.glb",
+            session_output_dir / "model.ply",
             session_output_dir / "camera_trajectory.json",
-            session_output_dir / "trajectory_preview.mp4",
             session_output_dir / "scene_manifest.json",
-            session_output_dir / "checkpoints" / "checkpoint_final.json",
-            session_output_dir / "checkpoints" / "gaussians_model.npz",
         ]
         missing = [str(f.name) for f in req_files if not f.exists() or f.stat().st_size == 0]
         if missing:
-            err_msg = f"Deliverable validation warning: Missing or empty files: {', '.join(missing)}"
-            logger.warning(err_msg)
+            logger.warning(f"Deliverable validation warning: Missing or empty files: {', '.join(missing)}")
 
         self.emit_event(
             StageType.EXPORT,
             StageStatus.COMPLETED,
             1.0,
-            f"Deliverables packaged in {session_output_dir.name}/ (PLY, OBJ, GLB, Trajectory, NPZ ready)",
-            metrics={"Format": "PLY + OBJ + GLB", "Status": "Complete"},
+            f"Deliverables packaged in {session_output_dir.name}/ (OBJ, GLB, PLY, Fused Dense PLY ready)",
+            metrics={
+                "Mesh Triangles": f"{poisson_res.triangle_count:,}",
+                "Format": "OBJ + GLB + PLY",
+                "Status": "Complete",
+            },
             global_progress=1.0,
             quality_score=quality_score,
         )
         return True
+
+    def _execute_stage_5_gsplat(self, *args, **kwargs):
+        """Deprecated: Replaced by Stage 6/7/8 Dense & Poisson pipeline."""
+        logger.warning("_execute_stage_5_gsplat is deprecated and removed.")
+        return None
+
+    def _execute_stage_6_export(self, *args, **kwargs):
+        """Deprecated alias to _execute_stage_9_export."""
+        return self._execute_stage_9_export(*args, **kwargs)

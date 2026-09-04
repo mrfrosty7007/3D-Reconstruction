@@ -34,30 +34,36 @@ class TestInAppOBJViewer(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def test_priority_obj_detection(self):
-        """Verify the exact detection order: mesh.obj > textured.obj > model.obj > *.obj."""
+        """Verify the exact detection order: model.obj > model.glb > model.ply > mesh.obj > *.obj."""
         # 1. Fallback *.obj
         fallback = self.tmp_path / "custom_scan.obj"
         fallback.write_text("v 0 0 0\n", encoding="utf-8")
         found = find_obj_file(self.tmp_path)
         self.assertEqual(found.name, "custom_scan.obj")
 
-        # 2. model.obj overrides fallback
-        model = self.tmp_path / "model.obj"
-        model.write_text("v 1 1 1\n", encoding="utf-8")
-        found = find_obj_file(self.tmp_path)
-        self.assertEqual(found.name, "model.obj")
-
-        # 3. textured.obj overrides model.obj
-        textured = self.tmp_path / "textured.obj"
-        textured.write_text("v 2 2 2\n", encoding="utf-8")
-        found = find_obj_file(self.tmp_path)
-        self.assertEqual(found.name, "textured.obj")
-
-        # 4. mesh.obj overrides textured.obj
+        # 2. mesh.obj overrides fallback
         mesh = self.tmp_path / "mesh.obj"
-        mesh.write_text("v 3 3 3\n", encoding="utf-8")
+        mesh.write_text("v 1 1 1\n", encoding="utf-8")
         found = find_obj_file(self.tmp_path)
         self.assertEqual(found.name, "mesh.obj")
+
+        # 3. model.ply overrides mesh.obj
+        ply = self.tmp_path / "model.ply"
+        ply.write_text("ply_data\n", encoding="utf-8")
+        found = find_obj_file(self.tmp_path)
+        self.assertEqual(found.name, "model.ply")
+
+        # 4. model.glb overrides model.ply
+        glb = self.tmp_path / "model.glb"
+        glb.write_text("glb_data\n", encoding="utf-8")
+        found = find_obj_file(self.tmp_path)
+        self.assertEqual(found.name, "model.glb")
+
+        # 5. model.obj overrides model.glb
+        model = self.tmp_path / "model.obj"
+        model.write_text("v 2 2 2\n", encoding="utf-8")
+        found = find_obj_file(self.tmp_path)
+        self.assertEqual(found.name, "model.obj")
 
     def test_trimesh_and_scene_support(self):
         """Verify Trimesh, Scene object handling, geometry merging, aspectmode='data', and zero margins."""

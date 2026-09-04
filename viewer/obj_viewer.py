@@ -31,10 +31,13 @@ logger = logging.getLogger("GeoRecon.OBJViewer")
 def find_obj_file(output_dir: Union[str, Path]) -> Optional[Path]:
     """
     Search the reconstruction output directory in this priority order:
-    1. mesh.obj
-    2. textured.obj
-    3. model.obj
-    4. any *.obj file (fallback)
+    1. model.obj
+    2. model.glb
+    3. model.ply
+    4. mesh.obj
+    5. textured.obj
+    6. any *.obj file (fallback)
+    7. dense/fused.ply or point_cloud.ply
 
     Returns the first valid, non-empty file found, or None.
     """
@@ -46,9 +49,11 @@ def find_obj_file(output_dir: Union[str, Path]) -> Optional[Path]:
         return None
 
     priority_candidates = [
+        dir_path / "model.obj",
+        dir_path / "model.glb",
+        dir_path / "model.ply",
         dir_path / "mesh.obj",
         dir_path / "textured.obj",
-        dir_path / "model.obj",
     ]
 
     for candidate in priority_candidates:
@@ -60,6 +65,10 @@ def find_obj_file(output_dir: Union[str, Path]) -> Optional[Path]:
     for candidate in obj_files:
         if candidate.is_file() and candidate.stat().st_size > 0:
             return candidate
+
+    for fallback in [dir_path / "dense" / "fused.ply", dir_path / "point_cloud.ply"]:
+        if fallback.is_file() and fallback.stat().st_size > 0:
+            return fallback
 
     return None
 
