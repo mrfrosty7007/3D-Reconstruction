@@ -273,11 +273,8 @@ class GSplatRunner:
             except Exception as e:
                 logger.debug(f"Text points parse fallback: {e}")
 
-        # Fallback synthetic seed cloud
-        np.random.seed(42)
-        pts = np.random.uniform(-1.5, 1.5, size=(10000, 3)).astype(np.float32)
-        cols = np.random.randint(60, 220, size=(10000, 3), dtype=np.uint8)
-        return pts, cols
+        logger.error(f"Failed to load any 3D points from {model_dir}")
+        raise RuntimeError(f"Cannot load COLMAP points3D from {model_dir}: no binary or text points found.")
 
     @staticmethod
     def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:

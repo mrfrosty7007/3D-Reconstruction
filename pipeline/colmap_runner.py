@@ -33,7 +33,7 @@ class ColmapSummary:
     registered_cameras: int = 0
     registration_percentage: float = 0.0
     sparse_point_count: int = 0
-    mean_reprojection_error: float = 0.0
+    mean_reprojection_error: Optional[float] = None
     device: str = "CUDA GPU"
     colmap_version: str = "4.1"
     runtime_seconds: float = 0.0
@@ -67,7 +67,7 @@ class ColmapRunner:
                     return res.stdout.strip().splitlines()[0]
             except Exception:
                 pass
-        return "NVIDIA GeForce RTX 4060 Laptop GPU" if self.is_gpu_available() else "CPU Fallback"
+        return "Unknown GPU" if self.is_gpu_available() else "CPU Fallback"
 
     def get_optimal_thread_count(self) -> int:
         """Returns bounded CPU thread count to prevent laptop CPU thermal throttling and thread starvation."""
@@ -176,10 +176,33 @@ class ColmapRunner:
 
     def is_gpu_available(self) -> bool:
         """Determines if NVIDIA CUDA GPU is available for COLMAP SIFT."""
-        has_cuda, _ = self.check_environment()
-        if shutil.which("nvidia-smi"):
+        if hasattr(self, "_is_cuda_supported"):
+            return self._is_cuda_supported
+        if not shutil.which("nvidia-smi"):
+            self._is_cuda_supported = False
+            return False
+        has_colmap, ver_line = self.check_environment()
+        if not has_colmap:
+            self._is_cuda_supported = False
+            return False
+        # COLMAP banner displays 'with CUDA' when compiled with CUDA support
+        if "CUDA" in ver_line.upper():
+            self._is_cuda_supported = True
             return True
-        return False
+        # Probing fallback
+        try:
+            cmd = [self.resolved_executable, "feature_extractor", "--help"]
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self._is_cuda_supported = "use_gpu" in (res.stdout + res.stderr)
+        except Exception:
+            self._is_cuda_supported = False
+        return self._is_cuda_supported
 
     def get_feature_extraction_gpu_flag_name(self) -> str:
         """Determines version-appropriate GPU flag for feature extraction."""
@@ -691,8 +714,10 @@ class ColmapRunner:
                                 pass
             if parsed_pts > 0:
                 summary.mean_reprojection_error = round(total_error / parsed_pts, 3)
+            else:
+                summary.mean_reprojection_error = None
         else:
-            summary.mean_reprojection_error = 0.015
+            summary.mean_reprojection_error = None
 
         # Compute accurate registration percentage
         if total_input_images > 0:

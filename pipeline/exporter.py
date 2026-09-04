@@ -126,9 +126,8 @@ class ModelExporter:
             import trimesh
             pcd = trimesh.load(str(ply_path), file_type="ply")
             if not hasattr(pcd, "vertices") or len(pcd.vertices) == 0:
-                pts = np.random.uniform(-1, 1, size=(500, 3))
-                cols = np.random.randint(50, 230, size=(500, 4), dtype=np.uint8)
-                pcd = trimesh.points.PointCloud(vertices=pts, colors=cols)
+                logger.error("Source PLY has no vertices; skipping GLB export.")
+                return False
 
             pcd.export(str(output_glb_path), file_type="glb")
             file_size_kb = output_glb_path.stat().st_size / 1024
