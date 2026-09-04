@@ -554,7 +554,7 @@ class PipelineManager:
 
         try:
             logger.info("=" * 75)
-            logger.info(f"🌐 GeoRecon AI Studio — 3DGS Reconstruction Session [{session_name}]")
+            logger.info(f"🌐 TerraSweep Studio — 3DGS Reconstruction Session [{session_name}]")
             logger.info(f"Input Video: {video_path}")
             logger.info(f"Frames Path: {session_frames_dir}")
             logger.info("Output Path: %s", session_output_dir)
@@ -1520,7 +1520,7 @@ class PipelineManager:
             "training_seconds": gsplat_res.training_time_seconds,
             "reprojection_error": colmap_summary.mean_reprojection_error,
             "gpu_used": getattr(gsplat_res, "device_used", "NVIDIA CUDA GPU"),
-            "viewer_model": "point_cloud.ply",
+            "viewer_model": "point_cloud.splat" if (session_output_dir / "point_cloud.splat").exists() else "point_cloud.ply",
             "trajectory_video": traj_video_name,
             "trajectory_duration_seconds": traj_res.get("trajectory_duration_seconds", 10.0),
             "trajectory_fps": traj_res.get("trajectory_fps", 30),
@@ -1559,6 +1559,7 @@ class PipelineManager:
             },
             "deliverables": {
                 "point_cloud_ply": "point_cloud.ply",
+                "point_cloud_splat": artifacts.get("point_cloud_splat", "point_cloud.splat"),
                 "model_obj": artifacts.get("model_obj", "model.obj"),
                 "model_glb": artifacts.get("model_glb", "model.glb"),
                 "camera_trajectory": artifacts.get("camera_trajectory", "camera_trajectory.json"),

@@ -265,7 +265,7 @@ class TrajectoryRenderer:
         vis = o3d.visualization.Visualizer()
         # Create hidden window for offscreen rendering
         vis.create_window(
-            window_name="GeoRecon Trajectory Offscreen Renderer",
+            window_name="TerraSweep Trajectory Offscreen Renderer",
             width=self.width,
             height=self.height,
             visible=False,

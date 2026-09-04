@@ -1,5 +1,5 @@
 """
-GeoRecon AI (SIH-26158) - Interactive 3D OBJ Mesh Viewer Module
+TerraSweep (SIH-26158) - Interactive 3D OBJ Mesh Viewer Module
 Provides hardware-accelerated interactive 3D OBJ mesh viewing using Trimesh and Plotly.
 Supports:
 - Left drag -> Rotate (Orbit)
@@ -203,7 +203,7 @@ def create_obj_figure(obj_path: Union[str, Path]) -> go.Figure:
     # Orbit controls: Left drag -> Rotate, Scroll -> Zoom, Right drag -> Pan
     fig.update_layout(
         title=dict(
-            text=f"GeoRecon AI — {path.name} ({len(vertices):,} vertices)",
+            text=f"TerraSweep — {path.name} ({len(vertices):,} vertices)",
             font=dict(size=14, color="#94A3B8"),
             x=0.02,
             y=0.98
@@ -280,7 +280,7 @@ def generate_obj_html(obj_path: Union[str, Path], output_html_path: Optional[Pat
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GeoRecon AI — 3D OBJ Mesh Viewer [{path.name}]</title>
+    <title>TerraSweep — 3D Reconstruction</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -337,7 +337,7 @@ def generate_obj_html(obj_path: Union[str, Path], output_html_path: Optional[Pat
 </head>
 <body>
     <div id="topbar">
-        <span class="badge">GeoRecon AI</span>
+        <span class="badge">TerraSweep</span>
         <span><b>3D Mesh:</b> {path.name}</span>
         <span style="color:#64748B;">|</span>
         <span style="color:#34D399;">WebGL Hardware Accelerated</span>
@@ -363,7 +363,7 @@ def generate_obj_html(obj_path: Union[str, Path], output_html_path: Optional[Pat
     return output_html_path
 
 
-def launch_obj_viewer_window(obj_path: Union[str, Path], title: str = "GeoRecon AI — 3D OBJ Mesh Viewer"):
+def launch_obj_viewer_window(obj_path: Union[str, Path], title: str = "TerraSweep — 3D OBJ Mesh Viewer"):
     """
     Opens an interactive hardware-accelerated 3D OBJ viewer window using pywebview (Edge WebView2)
     with automatic fallback to the system default browser.
@@ -393,7 +393,7 @@ def launch_obj_viewer_window(obj_path: Union[str, Path], title: str = "GeoRecon 
 
 def launch_obj_viewer_process(
     obj_path: Union[str, Path],
-    title: str = "GeoRecon AI — 3D OBJ Mesh Viewer"
+    title: str = "TerraSweep — 3D OBJ Mesh Viewer"
 ) -> Optional[object]:
     """
     Launches the 3D OBJ viewer in an independent non-blocking process so the main
@@ -447,9 +447,9 @@ def view_obj(obj_path: Union[str, Path]):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GeoRecon AI 3D OBJ Mesh Viewer")
+    parser = argparse.ArgumentParser(description="TerraSweep 3D OBJ Mesh Viewer")
     parser.add_argument("--model", type=str, required=True, help="Path to OBJ model file")
-    parser.add_argument("--title", type=str, default="GeoRecon AI — 3D OBJ Mesh Viewer", help="Window title")
+    parser.add_argument("--title", type=str, default="TerraSweep — 3D OBJ Mesh Viewer", help="Window title")
     args = parser.parse_args()
 
     try:

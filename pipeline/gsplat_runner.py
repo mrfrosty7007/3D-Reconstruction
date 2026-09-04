@@ -38,6 +38,7 @@ class GSplatTrainingResult:
     training_time_seconds: float = 0.0
     checkpoint_path: Optional[str] = None
     output_ply_path: Optional[str] = None
+    splat_path: Optional[str] = None
     npz_path: Optional[str] = None
     is_converged: bool = False
     error_message: Optional[str] = None
@@ -49,6 +50,53 @@ class GSplatRunner:
 
     def __init__(self, config: Optional[GSplatConfig] = None):
         self.config = config or GSplatConfig()
+
+    @staticmethod
+    def export_splat(
+        positions: np.ndarray,
+        scales: np.ndarray,
+        colors: np.ndarray,
+        opacities: np.ndarray,
+        rotations: np.ndarray,
+        splat_path: Path
+    ) -> bool:
+        """
+        Exports genuine 3D Gaussian Splatting binary (.splat) deliverable.
+        Standard 32-byte per Gaussian format (x,y,z float32, scale float32, rgba uint8, rot uint8).
+        Compatible with WebGL 3DGS visualizers, SuperSplat, and PlayCanvas.
+        """
+        try:
+            splat_path = Path(splat_path)
+            splat_path.parent.mkdir(parents=True, exist_ok=True)
+            N = len(positions)
+            if N == 0:
+                return False
+
+            rgba = np.zeros((N, 4), dtype=np.uint8)
+            rgba[:, :3] = np.clip(colors, 0, 255).astype(np.uint8)
+            rgba[:, 3] = np.clip(opacities.reshape(-1) * 255, 0, 255).astype(np.uint8)
+
+            rot = np.clip((rotations * 128.0 + 128.0), 0, 255).astype(np.uint8)
+
+            structured = np.zeros(N, dtype=[
+                ("pos", "3<f4"),
+                ("scale", "3<f4"),
+                ("color", "4u1"),
+                ("rot", "4u1")
+            ])
+            structured["pos"] = positions.astype(np.float32)
+            structured["scale"] = scales.astype(np.float32)
+            structured["color"] = rgba
+            structured["rot"] = rot
+
+            with open(splat_path, "wb") as f:
+                f.write(structured.tobytes())
+
+            logger.info(f"Exported standard 3DGS binary splat ({splat_path.stat().st_size / (1024*1024):.2f} MB, {N:,} Gaussians) -> {splat_path.name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to export .splat deliverable: {e}")
+            return False
 
     @staticmethod
     def find_best_model_dir(sparse_dir: Path) -> Path:
@@ -317,7 +365,18 @@ class GSplatRunner:
         logger.info(f"Loaded COLMAP Model: {num_cameras} registered cameras, {num_init_gaussians:,} sparse 3D seeds.")
 
         # 2. Check Device & Framework
-        import torch
+        try:
+            import torch
+            import torch.nn.functional as F
+        except ImportError:
+            venv_site = Path(__file__).resolve().parent.parent / ".venv" / "Lib" / "site-packages"
+            if venv_site.exists():
+                import sys
+                if str(venv_site) not in sys.path:
+                    sys.path.insert(0, str(venv_site))
+            import torch
+            import torch.nn.functional as F
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU Mode"
         logger.info(f"GSplat Optimization Device: {device} [{device_name}]")
@@ -349,11 +408,12 @@ class GSplatRunner:
         features_dc = torch.tensor(cols_norm, dtype=torch.float32, device=device, requires_grad=True)
 
         # 4. Configure Adam Optimizer
-        lr_pos = self.config.learning_rate_position * scene_radius
-        lr_feat = 0.0025
-        lr_opacity = 0.05
-        lr_scale = 0.005
-        lr_rot = 0.001
+        lr_pos = getattr(self.config, "learning_rate_position", 0.00016) * scene_radius
+        lr_feat = getattr(self.config, "learning_rate_feature", 0.0025)
+        lr_opacity = getattr(self.config, "learning_rate_opacity", 0.05)
+        lr_scale = getattr(self.config, "learning_rate_scaling", 0.005)
+        lr_rot = getattr(self.config, "learning_rate_rotation", 0.001)
+        densify_interval = getattr(self.config, "densify_interval", 100)
 
         optimizer = torch.optim.Adam([
             {"params": [means], "lr": lr_pos, "name": "means"},
@@ -363,12 +423,12 @@ class GSplatRunner:
             {"params": [quats], "lr": lr_rot, "name": "quats"},
         ])
 
-        # Pre-load or index ground truth training images
+        # Pre-load ground truth training images into GPU memory / cache
         cam_training_data = []
+        images_cache = {}
         for img_info in images_meta:
             img_path = images_dir / img_info["name"]
             if not img_path.exists():
-                # Check for alternative filename
                 alt_path = images_dir / Path(img_info["name"]).name
                 if alt_path.exists():
                     img_path = alt_path
@@ -392,6 +452,20 @@ class GSplatRunner:
                 "height": cam_spec["height"],
             })
 
+            # Preload and resize frame to GPU for fast photometric sampling
+            if img_path and img_path.exists():
+                try:
+                    im = Image.open(img_path).convert("RGB")
+                    max_dim = max(im.size)
+                    if max_dim > 960:
+                        scale_f = 960.0 / max_dim
+                        new_sz = (int(im.size[0] * scale_f), int(im.size[1] * scale_f))
+                        im = im.resize(new_sz, Image.Resampling.BILINEAR)
+                    im_arr = np.array(im, dtype=np.float32) / 255.0
+                    images_cache[img_info["name"]] = torch.from_numpy(im_arr).permute(2, 0, 1).unsqueeze(0).to(device)
+                except Exception as e:
+                    logger.debug(f"Could not cache image {img_info['name']}: {e}")
+
         if not cam_training_data:
             logger.warning("No camera views matched. Generating canonical viewports.")
             cam_training_data.append({
@@ -413,7 +487,7 @@ class GSplatRunner:
         current_psnr = 19.5
         current_gaussians = num_init_gaussians
 
-        logger.info(f"Starting CUDA Gaussian Splatting Training: {total_iterations:,} steps on {len(cam_training_data)} views.")
+        logger.info(f"Starting Genuine CUDA Gaussian Splatting Training: {total_iterations:,} steps on {len(cam_training_data)} views ({len(images_cache)} frames cached).")
 
         t_last_report = time.time()
         iter_last_report = 0
@@ -435,8 +509,7 @@ class GSplatRunner:
             view_idx = (it - 1) % len(cam_training_data)
             view = cam_training_data[view_idx]
 
-            # Mathematical forward projection & loss calculation
-            # Transform 3D means to Camera Coordinate Space
+            # Forward projection: 3D means to Camera Coordinate Space
             means_cam = torch.matmul(means, view["R"].T) + view["T"]  # [N, 3]
             depths = means_cam[:, 2]
             valid_mask = depths > 0.05
@@ -452,41 +525,72 @@ class GSplatRunner:
                 u = view["fx"] * (valid_means_cam[:, 0] / valid_depths) + view["cx"]
                 v = view["fy"] * (valid_means_cam[:, 1] / valid_depths) + view["cy"]
 
-                # Screen RGB color from SH degree 0
-                pred_rgb = torch.clamp(valid_feat * C0 + 0.5, 0.0, 1.0)
+                w, h = float(view["width"]), float(view["height"])
+                u_norm = 2.0 * (u / (w - 1.0)) - 1.0
+                v_norm = 2.0 * (v / (h - 1.0)) - 1.0
 
-                # Progressive loss calculation
-                t_prog = it / total_iterations
-                target_psnr_base = 24.0 + 9.5 * (1.0 - math.exp(-3.5 * t_prog))
+                in_frustum = (u_norm >= -1.0) & (u_norm <= 1.0) & (v_norm >= -1.0) & (v_norm <= 1.0)
 
-                # Compute genuine batch loss & gradients
-                mean_depth_loss = 0.01 * torch.mean((valid_depths - 1.5) ** 2)
-                reg_scale_loss = 0.001 * torch.mean(valid_scales ** 2)
-                reg_opac_loss = 0.001 * torch.mean((valid_opacities - 0.5) ** 2)
+                img_tensor = images_cache.get(view["name"])
+                if img_tensor is not None and in_frustum.sum() > 10:
+                    grid = torch.stack([u_norm[in_frustum], v_norm[in_frustum]], dim=-1).view(1, 1, -1, 2)
+                    gt_rgb = F.grid_sample(img_tensor, grid, align_corners=True, mode="bilinear").squeeze().T  # [M, 3]
+                    pred_rgb = torch.clamp(valid_feat[in_frustum] * C0 + 0.5, 0.0, 1.0)
 
-                # Simulated photo-metric residual between rendered sample and ground truth
-                sim_target_rgb = 0.5 + 0.4 * torch.sin(valid_means_cam[:, :3] * 1.5)
-                photo_loss = torch.mean(torch.abs(pred_rgb - sim_target_rgb))
+                    # Real L1 Photometric Loss against Ground Truth Pixels
+                    photo_loss = F.l1_loss(pred_rgb, gt_rgb)
+                    reg_scale = 0.0005 * torch.mean(valid_scales[in_frustum] ** 2)
+                    reg_opac = 0.0005 * torch.mean((valid_opacities[in_frustum] - 0.5) ** 2)
+                    loss = photo_loss + reg_scale + reg_opac
 
-                loss = photo_loss * math.exp(-2.5 * t_prog) + 0.008 + mean_depth_loss + reg_scale_loss + reg_opac_loss
-                loss.backward()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-                optimizer.step()
-                optimizer.zero_grad()
+                    current_loss = float(loss.item())
+                    mse = torch.mean((pred_rgb - gt_rgb) ** 2).item()
+                    current_psnr = 10.0 * math.log10(1.0 / max(1e-7, mse))
+                    if current_psnr > best_psnr:
+                        best_psnr = current_psnr
+                else:
+                    # Fallback forward step for un-cached view
+                    pred_rgb = torch.clamp(valid_feat * C0 + 0.5, 0.0, 1.0)
+                    mean_depth_loss = 0.01 * torch.mean((valid_depths - 1.5) ** 2)
+                    loss = mean_depth_loss + 0.001 * torch.mean(valid_scales ** 2)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    current_loss = float(loss.item())
 
-                current_loss = float(loss.item())
-                current_psnr = target_psnr_base + float(np.random.normal(0, 0.03))
-                if current_psnr > best_psnr:
-                    best_psnr = current_psnr
-
-            # Adaptive Densification & Pruning
+            # Real Adaptive Densification: Clone Gaussians in GPU memory
             if it % densify_interval == 0 and it < total_iterations * 0.7:
-                if current_gaussians < 140_000:
-                    growth = 1.03 + 0.02 * (1.0 - (it / total_iterations))
-                    current_gaussians = min(150_000, int(current_gaussians * growth))
+                with torch.no_grad():
+                    if len(means) < 120_000:
+                        num_to_add = min(10_000, max(500, int(len(means) * 0.12)))
+                        if len(means) + num_to_add <= 130_000:
+                            clone_idx = torch.randint(0, len(means), (num_to_add,), device=device)
+                            clone_scales = torch.exp(scales[clone_idx])
+                            disp = torch.randn_like(means[clone_idx]) * clone_scales * 0.35
+                            new_means = (means[clone_idx] + disp).detach().requires_grad_(True)
+                            new_scales = (scales[clone_idx] - 0.2).detach().requires_grad_(True)
+                            new_feat = features_dc[clone_idx].clone().detach().requires_grad_(True)
+                            new_opac = opacities[clone_idx].clone().detach().requires_grad_(True)
+                            new_quats = quats[clone_idx].clone().detach().requires_grad_(True)
 
-            if it % prune_interval == 0 and it < total_iterations * 0.8:
-                current_gaussians = max(num_init_gaussians, int(current_gaussians * 0.98))
+                            means = torch.cat([means, new_means], dim=0).requires_grad_(True)
+                            scales = torch.cat([scales, new_scales], dim=0).requires_grad_(True)
+                            features_dc = torch.cat([features_dc, new_feat], dim=0).requires_grad_(True)
+                            opacities = torch.cat([opacities, new_opac], dim=0).requires_grad_(True)
+                            quats = torch.cat([quats, new_quats], dim=0).requires_grad_(True)
+
+                            optimizer = torch.optim.Adam([
+                                {"params": [means], "lr": lr_pos, "name": "means"},
+                                {"params": [features_dc], "lr": lr_feat, "name": "features_dc"},
+                                {"params": [opacities], "lr": lr_opacity, "name": "opacities"},
+                                {"params": [scales], "lr": lr_scale, "name": "scales"},
+                                {"params": [quats], "lr": lr_rot, "name": "quats"},
+                            ])
+                            current_gaussians = len(means)
 
             # Periodic Checkpoint Saving (Latest & Best)
             if it % (total_iterations // 5) == 0 or it == total_iterations:
@@ -549,16 +653,16 @@ class GSplatRunner:
 
         total_train_time = round(time.time() - start_time, 2)
 
-        # 6. Save Gaussian Model NPZ (positions, scales, rotations, opacity, sh_coefficients)
+        # 6. Save Gaussian Model NPZ (positions, scales, rotations, opacity, sh_coefficients, colors)
         npz_path = checkpoints_dir / "gaussians_model.npz"
-        try:
-            # Extract final arrays
-            final_means = means.detach().cpu().numpy()
-            final_scales = np.exp(scales.detach().cpu().numpy())
-            final_quats = quats.detach().cpu().numpy()
-            final_opacities = 1.0 / (1.0 + np.exp(-opacities.detach().cpu().numpy()))
-            final_sh = features_dc.detach().cpu().numpy()
+        final_means = means.detach().cpu().numpy()
+        final_scales = np.exp(scales.detach().cpu().numpy())
+        final_quats = quats.detach().cpu().numpy()
+        final_opacities = 1.0 / (1.0 + np.exp(-opacities.detach().cpu().numpy()))
+        final_sh = features_dc.detach().cpu().numpy()
+        final_cols = np.clip((final_sh * C0 + 0.5) * 255.0, 0, 255).astype(np.uint8)
 
+        try:
             np.savez_compressed(
                 npz_path,
                 positions=final_means,
@@ -566,19 +670,24 @@ class GSplatRunner:
                 rotations=final_quats,
                 opacity=final_opacities,
                 sh_coefficients=final_sh,
+                colors=final_cols,
                 iterations=total_iterations,
                 psnr=current_psnr,
                 loss=current_loss,
             )
-            logger.info(f"Saved real Gaussian parameters to: {npz_path.name} ({npz_path.stat().st_size / (1024*1024):.2f} MB)")
+            logger.info(f"Saved real Gaussian parameters to: {npz_path.name} ({npz_path.stat().st_size / (1024*1024):.2f} MB, {len(final_means):,} Gaussians)")
         except Exception as e:
             logger.error(f"Failed to export gaussians_model.npz: {e}")
 
-        # 7. Export High-Fidelity PLY Model
+        # 7. Export High-Fidelity PLY Model from the trained dense Gaussians
         output_ply = output_dir / "point_cloud.ply"
-        self._export_ply(output_ply, init_pts, init_cols, current_gaussians)
+        self._export_ply(output_ply, final_means, final_cols, len(final_means))
 
-        # 8. Save Final Checkpoint Manifest
+        # 8. Export Standard 3DGS Binary .splat deliverable
+        output_splat = output_dir / "point_cloud.splat"
+        self.export_splat(final_means, final_scales, final_cols, final_opacities, final_quats, output_splat)
+
+        # 9. Save Final Checkpoint Manifest
         ckpt_final = checkpoints_dir / "checkpoint_final.json"
         with open(ckpt_final, "w", encoding="utf-8") as f:
             json.dump({
@@ -603,34 +712,20 @@ class GSplatRunner:
             training_time_seconds=total_train_time,
             checkpoint_path=str(ckpt_final),
             output_ply_path=str(output_ply),
+            splat_path=str(output_splat),
             npz_path=str(npz_path),
             is_converged=True,
             device_used=device_name,
         )
 
-    def _export_ply(self, ply_path: Path, seed_points: np.ndarray, seed_colors: np.ndarray, count: int):
-        """Generates a high-precision Point Cloud / Gaussian PLY deliverable."""
+    def _export_ply(self, ply_path: Path, points: np.ndarray, colors: np.ndarray, count: int):
+        """Generates a high-precision Point Cloud / Gaussian PLY deliverable from trained Gaussians."""
         try:
-            target_count = min(count, 85000)
-            if len(seed_points) < target_count and len(seed_points) > 0:
-                extra_needed = target_count - len(seed_points)
-                indices = np.random.choice(len(seed_points), size=extra_needed, replace=True)
-                extra_pts = seed_points[indices] + np.random.normal(0, 0.012, size=(extra_needed, 3)).astype(np.float32)
-                extra_cols = seed_colors[indices]
-                all_pts = np.vstack([seed_points, extra_pts])
-                all_cols = np.vstack([seed_colors, extra_cols])
-            elif len(seed_points) >= target_count:
-                all_pts = seed_points[:target_count]
-                all_cols = seed_colors[:target_count]
-            else:
-                all_pts = seed_points
-                all_cols = seed_colors
-
             from pipeline.exporter import ModelExporter
-            if not ModelExporter.export_ply_point_cloud(all_pts, all_cols, ply_path):
+            if not ModelExporter.export_ply_point_cloud(points, colors, ply_path):
                 raise IOError("Failed to export binary PLY point cloud")
 
-            logger.info(f"Exported binary PLY Model ({len(all_pts):,} vertices, {ply_path.stat().st_size / (1024*1024):.2f} MB) -> {ply_path}")
+            logger.info(f"Exported binary PLY Model ({len(points):,} vertices, {ply_path.stat().st_size / (1024*1024):.2f} MB) -> {ply_path}")
 
         except Exception as e:
             logger.error(f"Error writing PLY file: {e}")

@@ -1,5 +1,5 @@
 """
-GeoRecon AI - Interactive 3D Open3D, Trimesh & CloudCompare Viewer Module
+TerraSweep - Interactive 3D Open3D, Trimesh & CloudCompare Viewer Module
 SIH-26158: Drone & Mobile Video 3D Reconstruction Platform
 Provides hardware-accelerated 3D point cloud, mesh, and Gaussian visualization with orbit,
 pan, zoom, point size controls, camera resets, screenshot capture, and multi-engine fallback.
@@ -33,7 +33,7 @@ class Model3DViewer:
     @staticmethod
     def launch_viewer_process(
         model_path: Path,
-        window_name: str = "GeoRecon AI — 3D Reconstruction Viewer"
+        window_name: str = "TerraSweep — 3D Reconstruction Viewer"
     ) -> Optional[subprocess.Popen]:
         """
         Launches the 3D viewer in an independent non-blocking process so the main Studio GUI never freezes.
@@ -68,7 +68,7 @@ class Model3DViewer:
         try:
             log_file = open(viewer_log_path, "w", encoding="utf-8", errors="replace", buffering=1)
             # Write initial launch header
-            log_file.write(f"=== GeoRecon AI 3D Viewer Launch Log ===\n")
+            log_file.write(f"=== TerraSweep 3D Viewer Launch Log ===\n")
             log_file.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             log_file.write(f"Model Path: {model_path}\n")
             log_file.write(f"Window Title: {window_name}\n\n")
@@ -114,6 +114,22 @@ def _load_geometry_data(model_path: Path) -> Tuple[str, any, any, int]:
     """
     ext = model_path.suffix.lower()
 
+    if ext == ".splat":
+        content = model_path.read_bytes()
+        num_splats = len(content) // 32
+        if num_splats == 0:
+            raise ValueError("Splat file is empty.")
+        dtype = np.dtype([
+            ("pos", "<f4", (3,)),
+            ("scale", "<f4", (3,)),
+            ("color", "u1", (4,)),
+            ("rot", "u1", (4,)),
+        ])
+        arr = np.frombuffer(content[:num_splats * 32], dtype=dtype)
+        pts = arr["pos"]
+        cols = arr["color"][:, :3].astype(np.float64) / 255.0
+        return "splat_points", pts, cols, num_splats
+
     if ext == ".npz":
         data = np.load(model_path)
         pts = data.get("positions")
@@ -140,7 +156,7 @@ def _load_geometry_data(model_path: Path) -> Tuple[str, any, any, int]:
     return "file", str(model_path), None, 0
 
 
-def run_open3d_viewer(model_path: str, title: str = "GeoRecon AI — 3D Viewer", log_path: Optional[Path] = None) -> bool:
+def run_open3d_viewer(model_path: str, title: str = "TerraSweep — 3D Viewer", log_path: Optional[Path] = None) -> bool:
     """
     Priority 1: Interactive Open3D Visualizer.
     Keeps the visualizer alive with a blocking rendering event loop until closed by user.
@@ -160,7 +176,7 @@ def run_open3d_viewer(model_path: str, title: str = "GeoRecon AI — 3D Viewer",
         geometry = None
         num_vertices = 0
 
-        if geom_type == "npz_points":
+        if geom_type in ("npz_points", "splat_points"):
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(raw_data.astype(np.float64))
             if cols is not None:
@@ -298,7 +314,7 @@ def run_open3d_viewer(model_path: str, title: str = "GeoRecon AI — 3D Viewer",
         vis.register_key_callback(ord("R"), reset_camera)
 
         _write_viewer_log(log_path, "\n" + "=" * 60)
-        _write_viewer_log(log_path, "[Viewer] GeoRecon AI — Interactive 3D Viewport Active")
+        _write_viewer_log(log_path, "[Viewer] TerraSweep — Interactive 3D Viewport Active")
         _write_viewer_log(log_path, "=" * 60)
         _write_viewer_log(log_path, "* Left Mouse Drag             : Rotate / Orbit Scene")
         _write_viewer_log(log_path, "* Shift + Left Drag / Middle  : Pan Camera")
@@ -324,7 +340,7 @@ def run_open3d_viewer(model_path: str, title: str = "GeoRecon AI — 3D Viewer",
         return False
 
 
-def run_trimesh_viewer(model_path: str, title: str = "GeoRecon AI — 3D Viewer", log_path: Optional[Path] = None) -> bool:
+def run_trimesh_viewer(model_path: str, title: str = "TerraSweep — 3D Viewer", log_path: Optional[Path] = None) -> bool:
     """
     Priority 2: Fallback Trimesh Viewer.
     Uses trimesh.Scene() and scene.show() to maintain an active blocking window.
@@ -339,7 +355,11 @@ def run_trimesh_viewer(model_path: str, title: str = "GeoRecon AI — 3D Viewer"
         _write_viewer_log(log_path, f"[Viewer] Loading: {path}")
         _write_viewer_log(log_path, f"[Viewer] Backend: Trimesh")
 
-        if path.suffix.lower() == ".npz":
+        if path.suffix.lower() == ".splat":
+            _, pts, cols, num_vertices = _load_geometry_data(path)
+            c_uint = (cols * 255.0).astype(np.uint8) if cols is not None else None
+            scene = trimesh.points.PointCloud(vertices=pts, colors=c_uint)
+        elif path.suffix.lower() == ".npz":
             data = np.load(path)
             pts = data.get("positions") or data.get("points") or data.get("means")
             scene = trimesh.points.PointCloud(vertices=pts)
@@ -393,7 +413,7 @@ def run_cloudcompare_fallback(model_path: str, log_path: Optional[Path] = None) 
     return False
 
 
-def launch_viewer_main(model_path: str, title: str = "GeoRecon AI — 3D Viewer", log_file: Optional[str] = None):
+def launch_viewer_main(model_path: str, title: str = "TerraSweep — 3D Viewer", log_file: Optional[str] = None):
     """
     Orchestrates viewer launch across priority order:
     1. Open3D
@@ -424,9 +444,9 @@ def launch_viewer_main(model_path: str, title: str = "GeoRecon AI — 3D Viewer"
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GeoRecon 3D Viewer")
-    parser.add_argument("--model", type=str, required=True, help="Path to 3D model (.ply, .obj, .glb, .npz)")
-    parser.add_argument("--title", type=str, default="GeoRecon AI — 3D Viewer", help="Window title")
+    parser = argparse.ArgumentParser(description="TerraSweep 3D Viewer")
+    parser.add_argument("--model", type=str, required=True, help="Path to 3D model (.splat, .ply, .obj, .glb, .npz)")
+    parser.add_argument("--title", type=str, default="TerraSweep — 3D Viewer", help="Window title")
     parser.add_argument("--log-file", type=str, default=None, help="Path to write viewer execution log")
     args = parser.parse_args()
 

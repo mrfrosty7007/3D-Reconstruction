@@ -108,7 +108,7 @@ class ModelExporter:
                             vertices.append(f"v {parts[0]} {parts[1]} {parts[2]}")
 
                 with open(output_obj_path, "w", encoding="utf-8") as f:
-                    f.write("# GeoRecon AI Wavefront OBJ Model\n")
+                    f.write("# TerraSweep Wavefront OBJ Model\n")
                     f.write(f"# Vertices: {len(vertices)}\n\n")
                     f.write("\n".join(vertices) + "\n")
                 logger.info(f"Exported raw OBJ ({len(vertices):,} vertices) -> {output_obj_path.name}")
@@ -286,5 +286,10 @@ class ModelExporter:
         thumb_file = session_dir / "thumbnail.png"
         if self.generate_thumbnail(session_frames_dir, ply_file, thumb_file):
             artifacts["thumbnail"] = "thumbnail.png"
+
+        # 5. Gaussian Splat Asset (Standard 32-byte format)
+        splat_file = session_dir / "point_cloud.splat"
+        if splat_file.exists() and splat_file.stat().st_size > 0:
+            artifacts["point_cloud_splat"] = "point_cloud.splat"
 
         return artifacts

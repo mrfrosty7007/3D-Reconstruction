@@ -1,5 +1,5 @@
 """
-GeoRecon AI - Configuration Module
+TerraSweep - Configuration Module
 SIH-26158: Drone & Mobile Video 3D Reconstruction Platform
 """
 
@@ -90,7 +90,7 @@ class VideoConfig:
 @dataclass
 class AppConfig:
     """Main application configuration container."""
-    app_name: str = "GeoRecon AI"
+    app_name: str = "TerraSweep"
     app_subtitle: str = "Drone & Mobile 3D Reconstruction Platform [SIH-26158]"
     version: str = "1.1.0"
 

@@ -1,11 +1,11 @@
-# GeoRecon AI (SIH-26158)
+# TerraSweep (SIH-26158)
 ### Professional Drone & Mobile 3D Photogrammetry & Gaussian Splatting Studio
 **COLMAP Structure-from-Motion (CUDA) + Genuine 3D Gaussian Splatting (3DGS) + Open3D Viewport**
 
 ---
 
 ## 🌟 Overview
-**GeoRecon AI** is a professional-grade Windows desktop photogrammetry and neural reconstruction studio designed to convert aerial drone and mobile handheld video footage into high-fidelity 3D models. Modeled after industry-standard tools like RealityCapture, Metashape, and Unreal Engine, it orchestrates a complete 6-stage pipeline powered by GPU-accelerated **COLMAP Structure-from-Motion**, **3D Gaussian Splatting (`gsplat`)**, and an **Interactive Open3D 3D Viewport**.
+**TerraSweep** is a professional-grade Windows desktop photogrammetry and neural reconstruction studio designed to convert aerial drone and mobile handheld video footage into high-fidelity 3D models. Modeled after industry-standard tools like RealityCapture, Metashape, and Unreal Engine, it orchestrates a complete 6-stage pipeline powered by GPU-accelerated **COLMAP Structure-from-Motion**, **3D Gaussian Splatting (`gsplat`)**, and an **Interactive Open3D 3D Viewport**.
 
 ---
 

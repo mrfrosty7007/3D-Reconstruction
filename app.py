@@ -1,5 +1,5 @@
 """
-GeoRecon AI - Professional Photogrammetry & 3D Gaussian Splatting Studio
+TerraSweep - Professional Photogrammetry & 3D Gaussian Splatting Studio
 SIH-26158: Drone & Mobile Video 3D Reconstruction Platform
 """
 
@@ -299,7 +299,7 @@ class GeoReconApp(ctk.CTk):
         self.config = config
 
         # Window properties
-        self.title(f"{self.config.app_name} — {self.config.app_subtitle}")
+        self.title("TerraSweep")
         self.geometry(f"{self.config.window_width}x{self.config.window_height}")
         self.minsize(self.config.min_window_width, self.config.min_window_height)
 
@@ -414,7 +414,7 @@ class GeoReconApp(ctk.CTk):
 
         lbl_logo = ctk.CTkLabel(
             brand_frame,
-            text="🌐 SIH 3DGS",
+            text="🌐 TerraSweep",
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color="#38BDF8",
             anchor="w",
@@ -423,7 +423,7 @@ class GeoReconApp(ctk.CTk):
 
         lbl_sub = ctk.CTkLabel(
             brand_frame,
-            text="Reconstruction Studio",
+            text="3D Reconstruction Studio",
             font=ctk.CTkFont(size=11),
             text_color="#64748B",
             anchor="w",
@@ -682,7 +682,7 @@ class GeoReconApp(ctk.CTk):
 
         lbl_t = ctk.CTkLabel(
             top_row,
-            text="🛸 SIH 3D Reconstruction Studio",
+            text="🛸 TerraSweep — 3D Reconstruction Studio",
             font=ctk.CTkFont(size=19, weight="bold"),
             text_color="#F8FAFC",
             anchor="w",
@@ -2035,14 +2035,14 @@ class GeoReconApp(ctk.CTk):
                 session_title = session_dir.name
 
         if session_dir and session_dir.exists():
-            for candidate in ["point_cloud.ply", "model.obj", "model.glb", "checkpoints/gaussians_model.npz"]:
+            for candidate in ["point_cloud.splat", "point_cloud.ply", "model.obj", "model.glb", "checkpoints/gaussians_model.npz"]:
                 c_path = session_dir / candidate
                 if c_path.exists() and c_path.stat().st_size > 100:
-                    proc = Model3DViewer.launch_viewer_process(c_path, f"GeoRecon AI Studio Viewer — {session_title}")
+                    proc = Model3DViewer.launch_viewer_process(c_path, f"TerraSweep Studio Viewer — {session_title}")
                     if proc is not None:
                         logger.info(f"Launched 3D viewer for {session_title} ({candidate})")
                         return
-            messagebox.showwarning("File Missing", f"3D model (point_cloud.ply / model.obj / model.glb) not found in {session_title}")
+            messagebox.showwarning("File Missing", f"3D model (point_cloud.splat / point_cloud.ply / model.obj / model.glb) not found in {session_title}")
         else:
             messagebox.showwarning("No Model", "No completed 3D reconstruction model found for this session.")
 
@@ -3201,7 +3201,7 @@ class GeoReconApp(ctk.CTk):
             logger.info(f"Launching interactive 3D OBJ mesh viewer for: {obj_file}")
             proc = launch_obj_viewer_process(
                 obj_path=obj_file,
-                title=f"GeoRecon AI — 3D OBJ Mesh Viewer [{obj_file.name}]"
+                title=f"TerraSweep — 3D OBJ Mesh Viewer [{obj_file.name}]"
             )
             if not proc:
                 raise RuntimeError("Failed to spawn 3D OBJ mesh viewer process.")
@@ -3346,7 +3346,7 @@ def main():
         app = GeoReconApp()
         app.mainloop()
     except Exception as e:
-        logger.critical(f"Fatal error in GeoRecon AI application: {e}", exc_info=True)
+        logger.critical(f"Fatal error in TerraSweep application: {e}", exc_info=True)
         sys.exit(1)
 
 
