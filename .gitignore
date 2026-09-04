@@ -1,7 +1,7 @@
 # Python
+.venv/
 __pycache__/
 *.pyc
-.venv/
 
 # Build
 build/
@@ -13,7 +13,5 @@ data/*/frames/
 data/*/sparse/
 data/*/dense/
 *.db
-
-# Temporary
 *.log
 *.tmp
