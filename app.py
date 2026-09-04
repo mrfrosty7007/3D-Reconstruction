@@ -44,6 +44,7 @@ from pipeline import (
     PIPELINE_STATUS_RUNNING,
     HardwareSnapshot,
 )
+from viewer.obj_viewer import find_obj_file, launch_obj_viewer_process
 
 # Root Logging Setup
 LOG_FILENAME = DEFAULT_CONFIG.logs_dir / f"georecon_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -1307,31 +1308,42 @@ class GeoReconApp(ctk.CTk):
 
         btn_grid = ctk.CTkFrame(deliv_card, fg_color="transparent")
         btn_grid.pack(fill="x", padx=16, pady=(0, 16))
-        btn_grid.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+        btn_grid.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6), weight=1)
+
+        self.btn_view_mesh = ctk.CTkButton(
+            btn_grid,
+            text="👁 View Mesh",
+            height=38,
+            fg_color="#6366F1",
+            hover_color="#4F46E5",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._on_view_mesh,
+        )
+        self.btn_view_mesh.grid(row=0, column=0, padx=(0, 3), sticky="ew")
 
         ctk.CTkButton(
             btn_grid, text="👁️ Open 3D Viewer", height=38, fg_color="#0284C7", hover_color="#0369A1", font=ctk.CTkFont(size=12, weight="bold"), command=self._on_open_viewer
-        ).grid(row=0, column=0, padx=(0, 3), sticky="ew")
-
-        ctk.CTkButton(
-            btn_grid, text="🎥 Play Trajectory", height=38, fg_color="#10B981", hover_color="#059669", font=ctk.CTkFont(size=12, weight="bold"), command=self._on_play_trajectory_video
         ).grid(row=0, column=1, padx=3, sticky="ew")
 
         ctk.CTkButton(
-            btn_grid, text="📂 Open Folder", height=38, fg_color="#334155", hover_color="#475569", font=ctk.CTkFont(size=12), command=self._on_open_session_folder
+            btn_grid, text="🎥 Play Trajectory", height=38, fg_color="#10B981", hover_color="#059669", font=ctk.CTkFont(size=12, weight="bold"), command=self._on_play_trajectory_video
         ).grid(row=0, column=2, padx=3, sticky="ew")
 
         ctk.CTkButton(
-            btn_grid, text="💾 Export PLY", height=38, fg_color="#1E2330", hover_color="#2B3245", font=ctk.CTkFont(size=12), command=self._export_ply_dialog
+            btn_grid, text="📂 Open Folder", height=38, fg_color="#334155", hover_color="#475569", font=ctk.CTkFont(size=12), command=self._on_open_session_folder
         ).grid(row=0, column=3, padx=3, sticky="ew")
 
         ctk.CTkButton(
-            btn_grid, text="📦 Export OBJ", height=38, fg_color="#1E2330", hover_color="#2B3245", font=ctk.CTkFont(size=12), command=self._export_obj_dialog
+            btn_grid, text="💾 Export PLY", height=38, fg_color="#1E2330", hover_color="#2B3245", font=ctk.CTkFont(size=12), command=self._export_ply_dialog
         ).grid(row=0, column=4, padx=3, sticky="ew")
 
         ctk.CTkButton(
+            btn_grid, text="📦 Export OBJ", height=38, fg_color="#1E2330", hover_color="#2B3245", font=ctk.CTkFont(size=12), command=self._export_obj_dialog
+        ).grid(row=0, column=5, padx=3, sticky="ew")
+
+        ctk.CTkButton(
             btn_grid, text="🌐 Export GLB", height=38, fg_color="#1E2330", hover_color="#2B3245", font=ctk.CTkFont(size=12), command=self._export_glb_dialog
-        ).grid(row=0, column=5, padx=(3, 0), sticky="ew")
+        ).grid(row=0, column=6, padx=(3, 0), sticky="ew")
 
     def _create_summary_card(self, master, c: int, title: str, init_val: str) -> ctk.CTkLabel:
         card = ctk.CTkFrame(master, fg_color="#131722", corner_radius=8, border_width=1, border_color="#202738")
@@ -3132,6 +3144,26 @@ class GeoReconApp(ctk.CTk):
         else:
             self.lbl_fin_coords.configure(text="Coordinates: Local Origin (No GPS attached)")
 
+        # Automatic OBJ Detection & Export Format check (SIH-26158)
+        obj_file = find_obj_file(target_dir)
+        is_obj_format = (hasattr(self, "opt_export") and self.opt_export.get() == "OBJ Mesh")
+
+        if hasattr(self, "btn_view_mesh"):
+            if obj_file and obj_file.exists():
+                self.btn_view_mesh.configure(
+                    state="normal",
+                    text="👁 View Mesh",
+                    fg_color="#6366F1" if is_obj_format else "#1E2330",
+                    hover_color="#4F46E5" if is_obj_format else "#2B3245"
+                )
+            else:
+                self.btn_view_mesh.configure(
+                    state="normal" if is_obj_format else "disabled",
+                    text="👁 View Mesh",
+                    fg_color="#6366F1" if is_obj_format else "#1A1D24",
+                    hover_color="#4F46E5" if is_obj_format else "#1A1D24"
+                )
+
     def _on_open_viewer(self):
         """Launches the interactive 3D viewport on the current reconstructed model."""
         session_dir = self._get_active_finished_session_dir()
@@ -3139,6 +3171,46 @@ class GeoReconApp(ctk.CTk):
             self._launch_session_viewer(session_dir)
         else:
             messagebox.showwarning("No Model", "No completed 3D reconstruction model found to view.")
+
+    def _on_view_mesh(self):
+        """Opens the embedded interactive 3D OBJ mesh viewer using Trimesh + Plotly."""
+        session_dir = self._get_active_finished_session_dir()
+        if not session_dir or not session_dir.exists():
+            messagebox.showwarning(
+                "No Reconstruction",
+                "No completed reconstruction session available to view.\n\n"
+                "Please run a reconstruction in Studio first."
+            )
+            return
+
+        obj_file = find_obj_file(session_dir)
+        if not obj_file or not obj_file.exists():
+            messagebox.showwarning(
+                "No OBJ Found",
+                f"No valid OBJ mesh found in reconstruction directory:\n{session_dir.name}\n\n"
+                "Searched in priority order:\n"
+                "• mesh.obj\n"
+                "• textured.obj\n"
+                "• model.obj\n"
+                "• any *.obj file\n\n"
+                "Please ensure the reconstruction or OBJ export completed successfully."
+            )
+            return
+
+        try:
+            logger.info(f"Launching interactive 3D OBJ mesh viewer for: {obj_file}")
+            proc = launch_obj_viewer_process(
+                obj_path=obj_file,
+                title=f"GeoRecon AI — 3D OBJ Mesh Viewer [{obj_file.name}]"
+            )
+            if not proc:
+                raise RuntimeError("Failed to spawn 3D OBJ mesh viewer process.")
+        except Exception as e:
+            logger.error(f"Failed to open OBJ mesh viewer: {e}", exc_info=True)
+            messagebox.showerror(
+                "Viewer Error",
+                f"Failed to launch interactive 3D OBJ viewer:\n\n{e}"
+            )
 
     def _on_select_video(self):
         chosen = filedialog.askopenfilename(
